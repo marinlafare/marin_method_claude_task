@@ -1,0 +1,313 @@
+================================================================================
+REALTIME PITCH — ARCHITECTURE v3
+Deployment packaging for: MPM-in-WASM (client authoritative) +
+                          Melodia-on-server (advisory octave oracle),
+                          served to REMOTE USERS over WAN via a webpage.
+================================================================================
+
+--------------------------------------------------------------------------------
+VERDICT
+--------------------------------------------------------------------------------
+  (a) One Docker app — server + webUI in one container.     ← DO THIS.
+
+  (b) Two Docker apps                                       ← not yet.
+  (c) Docker UI + local backend                             ← contradicts
+                                                              "remote user".
+  (d) No Docker                                             ← dev yes, prod no.
+
+--------------------------------------------------------------------------------
+1. WHY THE WASM/MELODIA SPLIT CHANGES THE QUESTION
+--------------------------------------------------------------------------------
+Once MPM runs in the browser, the server's job shrinks dramatically:
+
+                       Before WASM            After WASM
+    ─────────────────  ────────────────────  ────────────────────────────
+    Pitch critical     server                client (WASM MPM)
+    path
+    Server CPU/user    ~47 Hz × ~1.5 ms      ~12 Hz × ~2 ms
+                       ≈ 7 % of a core/user  ≈ 2.4 % of a core/user
+                       (every hop)           (every 4th hop, advisory)
+    Latency-critical   server round-trip     zero — client draws
+    loop                                     independently
+    WS bandwidth       ~96 KB/s upstream     ~24 KB/s upstream
+                       (every hop, 1024      (every 4th hop)
+                        samples int16)
+    Server role        authoritative         static files + slow oracle
+
+Your "server" is now 90 % a static file host and 10 % a low-bandwidth advisor.
+That is the profile of a single tiny process, not a microservice fleet.
+
+--------------------------------------------------------------------------------
+2. OPTION-BY-OPTION
+--------------------------------------------------------------------------------
+
+── (a) ONE DOCKER APP ─────────────────────────────── RECOMMENDED ──────────
+
+  Shape:
+      ┌────────────── single container ──────────────┐
+      │  uvicorn realtime_pitch.main:app             │
+      │    ├─ /realtime/stream   (WS, Melodia only)  │
+      │    ├─ /realtime/health                       │
+      │    └─ /*  (StaticFiles: index.html,          │
+      │            mpm.wasm, worklet.js, app.js)     │
+      └──────────────────────────────────────────────┘
+
+  FastAPI already ships StaticFiles. One line in main.py:
+      app.mount("/", StaticFiles(directory="web/dist", html=True), name="static")
+
+  Pros specific to YOUR case:
+    - Same-origin WS.  wss://yourdomain/realtime/stream served from
+      https://yourdomain/.  Zero CORS. Zero preflight. No origin whitelist
+      to keep in sync.  (main.py currently whitelists localhost:5173 —
+      that whole CORSMiddleware block disappears.)
+    - getUserMedia requires HTTPS (or localhost).  One container = one
+      domain = one TLS cert.  Caddy or Traefik in front gets Let's Encrypt
+      automatically.
+    - No protocol version skew.  Frontend expects {seq, midi, voiced, ...};
+      backend produces it.  In one repo, one image, they ship atomically.
+      In (b) you WILL forget to bump one side.
+    - No WebSocket sticky-session problem.  RealtimePitchState is per-
+      connection (stream.py:41).  Single process → no session affinity
+      needed.  Scale later with uvicorn --workers N + ip_hash if you ever
+      outgrow one process.
+    - Build reproducibility.  aubio==0.4.9, pyworld==0.3.4,
+      praat-parselmouth==0.4.5 all have native C extensions.  They are
+      picky about glibc, libstdc++, libsndfile.  Docker pins the entire
+      toolchain once; otherwise deployment is "works on my machine"
+      roulette at 2 AM.
+
+  Scaling headroom (the real number):
+      hop=1024 @ 48 kHz → 21.3 ms per hop → ~47 hops/s/user
+      Server sees 1 in K hops, K=4 → ~12 Melodia calls/s/user
+      Melodia on 1024-sample frame ≈ 1.5–3 ms (4096-pt FFT + 8 harmonic
+        interp passes, pure numpy — see melodia.py:32-68)
+      → ≈ 24–36 ms CPU per second per user ≈ 2.4–3.6 % of one core/user
+      → 4-core $20/mo VPS handles ~110–160 concurrent singers before
+        hitting 100 % CPU.
+      You will not need (b) for a very long time.
+
+── (b) TWO DOCKER APPS ──────────────────────────── PREMATURE ──────────────
+
+  What it buys you:
+    - Independent deploy cadence (ship UI without touching backend).
+    - Independent horizontal scaling.
+    - CDN the frontend, geo-distribute the backend.
+
+  What it costs you:
+    - 2 Dockerfiles, 2 CI pipelines, docker-compose or k8s manifests.
+    - CORS must be CORRECTLY configured (origin whitelist, credentials
+      policy, WS upgrade headers).  main.py currently hardcodes
+      http://localhost:5173 — this becomes an env var, and you'll get
+      it wrong at least once in staging.
+    - WebSocket reverse-proxy config.  nginx/traefik need explicit
+      Upgrade/Connection header passthrough.  Not hard, but one more
+      thing to debug when the WS handshake 502s.
+    - Version skew risk.  Frontend sends {sr, hop_size, algo, ...};
+      backend expects a matching schema (models.py EngineConfig).
+      Atomic deploy of one image prevents "I deployed the new UI but
+      forgot to roll the backend" incidents.
+
+  When to revisit (b):
+    - Frontend ships weekly, backend ships monthly → cadence divergence
+      makes atomic deploys painful.
+    - You add a second backend service (recording upload, user auth,
+      leaderboard) that genuinely needs its own lifecycle.
+    - You actually saturate 4 cores with Melodia advisory calls AND
+      serving static files is measurably contending for them (unlikely —
+      static file serving in uvicorn is async sendfile, ~0 CPU).
+
+  None of these are true at day one.
+
+── (c) DOCKER UI + LOCAL BACKEND ──────────────── CONTRADICTS BRIEF ────────
+
+  "Local implementation for the backend" means the remote user would need
+  to run a Python process on their own machine.  That is a downloadable
+  desktop app, not a webpage.  It directly contradicts "webpage for a
+  remote user".
+
+  The one semi-legitimate use case: a privacy-focused variant where the
+  user installs a companion app and the webpage connects to
+  ws://localhost:8000.  But then:
+    - Mixed-content block: an HTTPS page can't open ws:// (only wss://).
+      You'd need a self-signed cert on localhost or serve the page over
+      plain HTTP, both of which are worse UX than just doing WASM.
+    - You've already moved the critical path to WASM — the only thing
+      left on the server is advisory Melodia.  If privacy demands no
+      upstream audio, just DISABLE the WS and run WASM-only with a
+      simplified spectral tie-break (see architecture_v2.txt §5.2).
+      That's a feature flag, not an architecture.
+
+  Reject.
+
+── (d) NO DOCKER, ALL LOCAL ─────────────── FINE FOR DEV, BAD FOR PROD ─────
+
+  For your laptop: sure.  uvicorn on :8000, Vite on :5173, iterate fast,
+  no container rebuild on every edit.  This is the correct DEVELOPMENT
+  inner loop and should coexist with (a).
+
+  For production on a remote host:
+    - Reproducibility.  requirements.txt pins versions but not the
+      system libsndfile, gcc toolchain, glibc, python minor version.
+      aubio and pyworld compile native code at install.  The host's
+      apt packages will drift from yours.
+    - Rollback.  Docker rollback = swap image tag, 5 seconds.
+      Bare-metal rollback = pip freeze snapshots, venv juggling, hope
+      you didn't apt upgrade libsomething.
+    - Fresh-host bootstrap.  With (a): docker pull && docker run.
+      Without: apt install build-essential libsndfile1-dev python3.11-dev,
+      pip install, debug why parselmouth can't find Praat headers, etc.
+
+  Keep (d) for development.  Ship (a) to production.
+
+--------------------------------------------------------------------------------
+3. CONCRETE IMPLEMENTATION — OPTION (a)
+--------------------------------------------------------------------------------
+
+3.1  Repo layout additions
+
+    realtime_pitch/          (existing — unchanged)
+    web/
+      src/
+        audio/capture.ts      getUserMedia + AudioContext (EC/NS/AGC off)
+        audio/worklet.js      128-sample aggregator → hop buffer
+        wasm/mpm.wasm         compiled MPM kernel (CMND + pick)
+        wasm/mpm.ts           JS glue, TypedArray in/out
+        transport.ts          WS client, advisory-only, K-hop cadence
+        render/viewport.ts    canvas piano-roll, scrolling record
+        main.ts
+      vite.config.ts
+      package.json
+    Dockerfile
+    .dockerignore
+
+3.2  main.py — add static mount, drop CORS
+
+    # after existing app = FastAPI(...):
+    from fastapi.staticfiles import StaticFiles
+    app.mount("/", StaticFiles(directory="web/dist", html=True), name="static")
+
+    # The CORSMiddleware block (allow_origins=["http://localhost:5173"])
+    # is no longer needed in production — same origin.  Gate it behind
+    # an env var for dev mode only.
+
+3.3  Dockerfile — multi-stage, pin the native deps once
+
+    # ---------- build frontend ----------
+    FROM node:20-slim AS web
+    WORKDIR /w
+    COPY web/package*.json ./
+    RUN npm ci
+    COPY web/ .
+    RUN npm run build            # -> /w/dist/{index.html, *.js, *.wasm}
+
+    # ---------- build python wheels (native ext compile) ----------
+    FROM python:3.11-slim AS py-build
+    RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential libsndfile1-dev \
+     && rm -rf /var/lib/apt/lists/*
+    COPY realtime_pitch/requirements.txt .
+    RUN pip wheel --wheel-dir /wheels -r requirements.txt
+
+    # ---------- runtime (slim, no compilers) ----------
+    FROM python:3.11-slim
+    RUN apt-get update && apt-get install -y --no-install-recommends \
+        libsndfile1 \
+     && rm -rf /var/lib/apt/lists/*
+    COPY --from=py-build /wheels /wheels
+    RUN pip install --no-index --find-links /wheels \
+        fastapi 'uvicorn[standard]' numpy aubio pyworld praat-parselmouth \
+     && rm -rf /wheels
+    COPY realtime_pitch/ /app/realtime_pitch/
+    COPY --from=web /w/dist /app/web/dist
+    WORKDIR /app
+    ENV PYTHONPATH=/app/realtime_pitch
+    CMD ["uvicorn", "realtime_pitch.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+    # Image size: ~250–300 MB.  Mostly numpy + parselmouth's Praat
+    # binaries.  Not worth optimising further at this stage.
+
+3.4  Run it
+
+    docker build -t rtpitch .
+    docker run -p 8000:8000 rtpitch
+
+    # With TLS (production) — Caddy reverse proxy, 3-line Caddyfile:
+    # yourdomain.com {
+    #     reverse_proxy rtpitch:8000
+    # }
+    # Caddy gets Let's Encrypt automatically. WS upgrade passes
+    # transparently.
+
+--------------------------------------------------------------------------------
+4. REVISED PROTOCOL FOR ADVISORY-ONLY SERVER
+--------------------------------------------------------------------------------
+Client is now authoritative; server is advisory.  Two changes to the WS
+contract from architecture_v1:
+
+4.1  Upstream cadence
+
+    Client sends PCM every Kth hop (default K=4).  Optionally even less:
+    only when WASM MPM's confidence drops below a threshold, OR when MPM
+    makes a jump > 6 semitones (potential octave error — exactly when you
+    want the Melodia second opinion).
+
+    if (seq % K !== 0 && mpm_conf > 0.7 && !recent_big_jump) skip_send();
+
+4.2  Advisory reply — include client's belief so server can confirm/deny
+
+    Client → Server  (when it does send):
+      [binary PCM hop] + tiny text pre-message once per batch:
+      {"seq": N, "client_f0": 220.1, "client_conf": 0.81}
+
+    Server → Client:
+      {
+        "type": "advisory",
+        "seq": N,
+        "f0_hz": 218.9,          // Melodia's answer
+        "conf": 0.74,
+        "agrees": true,          // |log2(client_f0/f0_hz)| < 0.1 octave
+        "stale_ms": 34.2         // so client can discard if too late
+      }
+
+    Client on receipt:
+      if (!reply.agrees && reply.stale_ms < 300) {
+        // Retroactive fix: repaint the piano-roll strip from seq N
+        // onwards using the server's octave.  The WASM MPM keeps its
+        // cents-precision; only the octave is corrected.
+        noteFeed.correctOctave(reply.seq, reply.f0_hz);
+        viewport.repaintFrom(reply.seq);
+      }
+
+    "Repaint a 300 ms strip" = redraw ~14 segments.  Imperceptible cost.
+
+--------------------------------------------------------------------------------
+5. DECISION TREE
+--------------------------------------------------------------------------------
+
+  Remote users over WAN?
+  │
+  ├─ YES (your case) ─→ (a) single Docker.  MPM in WASM, Melodia advisory.
+  │                     Caddy in front for TLS.  Ship.
+  │                     Graduate to (b) ONLY when you observe real
+  │                     cadence divergence or CPU saturation.
+  │
+  ├─ Localhost/LAN only ─→ (d) for dev, (a) for packaging if you ever
+  │                        hand it to someone else.  Skip WASM entirely
+  │                        (see architecture_v2.txt §6).
+  │
+  └─ Desktop app distribution ─→ different product.  Electron or Tauri
+                                 bundling uvicorn as a subprocess.
+                                 Neither (a)–(d) quite fits; out of scope.
+
+--------------------------------------------------------------------------------
+6. TL;DR
+--------------------------------------------------------------------------------
+  Your server is a static file host with a slow-cadence advisory endpoint.
+  That's one tiny process.  One container.  Same origin eliminates CORS.
+  One TLS cert, one deploy, one rollback.  Native C deps (aubio, pyworld,
+  parselmouth) get pinned once in the Dockerfile and never bite you again.
+
+  Build (a).  Keep (d) as your dev inner loop.  Ignore (b) until you have
+  an actual scaling or cadence problem — you won't for the first ~100
+  concurrent users.  (c) contradicts the brief.
+================================================================================

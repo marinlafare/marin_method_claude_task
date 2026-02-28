@@ -1,0 +1,306 @@
+================================================================================
+REALTIME PITCH — ARCHITECTURE v2
+Answering: (a) MPM primary + YIN/Melodia refine  vs.
+           (b) MPM + YIN + Melodia consensus     vs.
+           (c) push all three to WASM
+================================================================================
+
+--------------------------------------------------------------------------------
+RECOMMENDATION IN ONE LINE
+--------------------------------------------------------------------------------
+Use (b), but CHEAPLY. Implement a "cascaded consensus" that shares 90 % of the
+heavy math between MPM and YIN, votes on OCTAVE, and uses Melodia only as a
+tie-breaker. Do NOT port to WASM for localhost/LAN; port ONE algorithm (MPM)
+to WASM only if you must deploy over WAN.
+
+The rest of this document explains why.
+
+--------------------------------------------------------------------------------
+1. THE SURPRISING FACT THAT CHANGES EVERYTHING
+--------------------------------------------------------------------------------
+After reading your mpm.py and yin.py: they are almost the same algorithm.
+
+    MPM _mpm_difference()   → windowed FFT autocorr + cumulative energy
+    YIN _difference()       → windowed FFT autocorr + cumulative energy
+    Both → CMND → threshold-pick → parabolic interp → octave guard
+
+    Compare yin.py:37-63 and mpm.py:37-61: the FFT (O(N log N) step, ~70 % of
+    the compute) is IDENTICAL. The divergence is:
+      - YIN: absolute_threshold (strict <0.07), octave-DOWN guard (tau*2)
+      - MPM: softer threshold (<0.25), octave-UP guard (tau/2),
+             extra _resolve_subharmonic_from_frame() spectral check.
+
+Implication: "running YIN and MPM in parallel" costs ~1.3x, not 2x, if you
+factor the CMND pipeline into a single function and branch only at the picking
+stage. You get two candidates almost for free.
+
+--------------------------------------------------------------------------------
+2. WHAT EACH ALGORITHM IS ACTUALLY GOOD AT (for voice)
+--------------------------------------------------------------------------------
+  Dimension              MPM            YIN            Melodia
+  ─────────────────────  ─────────────  ─────────────  ─────────────────────
+  Domain                 time (ACF)     time (ACF)     frequency (harmonic
+                                                        summation)
+  Latency needs          1 hop          1 hop          1 hop
+  Compute (1024 @ 48k)   ~0.8–1.5 ms    ~0.5–1.0 ms    ~1.5–3.0 ms
+                                                        (4096-pt FFT + 8
+                                                         interp passes)
+  Strong on              clean voice,   clean voice,   breathy/noisy voice,
+                         breathy OK     high SNR       polyphonic leakage
+  Weak on                subharmonics   subharmonics   LOW f0 (coarse bin
+                         → tends to go  → tends to go  resolution), vibrato
+                         DOWN an octave UP an octave   → jitter
+  Confidence tells you   periodicity    periodicity    spectral peak
+                                                        contrast (completely
+                                                        different meaning)
+  Already has            harmonic       minimal        built-in subharmonic
+                         subharm check                 penalty (line 67-68)
+
+Key insight: MPM and YIN fail in OPPOSITE OCTAVE DIRECTIONS. If they agree,
+the octave is almost certainly correct. If they disagree by ≈ 12 semitones,
+Melodia's harmonic-domain evidence breaks the tie — it's a different family
+of estimator, so its errors are decorrelated.
+
+--------------------------------------------------------------------------------
+3. OPTION (a) — MPM primary, YIN + Melodia refine
+--------------------------------------------------------------------------------
+    Run MPM every hop.
+    On "suspicious" frames only → run YIN + Melodia → adjust MPM result.
+
+  Pros:
+    - Lowest average compute. ~1 ms per hop in steady state.
+    - Simple mental model: one estimator owns the truth.
+
+  Cons:
+    - Defining "suspicious" is hard. Typical heuristics (conf drop, big jump,
+      near octave boundary) all lag by 1–3 hops → you've already drawn the
+      wrong pixel before the refinement fires.
+    - Refinement pipeline = branchy code. Three estimators × one post-
+      processor state is easy; three estimators × conditional refinement ×
+      state reconciliation is a maintenance headache.
+    - Worst-case latency SPIKES: normally 1 ms → when suspicious, suddenly
+      4–5 ms. Jitter in proc_ms is worse for UX than a slightly higher but
+      flat proc_ms.
+    - MPM's weakness (subharmonics / octave-down) is a SILENT failure — conf
+      stays high. The trigger for refinement won't fire, and you draw the
+      wrong octave confidently.
+
+  Verdict: the gating logic is the weak link, and the silent-failure mode
+  defeats the purpose. Skip.
+
+--------------------------------------------------------------------------------
+4. OPTION (b) — Consensus (all three every hop)     [RECOMMENDED]
+--------------------------------------------------------------------------------
+4.1  Naive version (don't do this)
+
+  f_mpm, c_mpm = mpm_pitch(x, ...)
+  f_yin, c_yin = yin_pitch(x, ...)
+  f_mel, c_mel, _ = melodia_pitch(x, ...)
+  f0 = weighted_median([f_mpm, f_yin, f_mel], [c_mpm, c_yin, c_mel])
+
+  Compute: ~3–5 ms per hop. Doable but wasteful (double FFT, see §1).
+  Deeper problem: c_mpm and c_mel are NOT commensurable — MPM confidence is
+  1-CMND (periodicity), Melodia confidence is contrast/prominence (spectral
+  peakiness). A weighted average mixes apples and oranges.
+
+4.2  Cascaded consensus (do this)
+
+  STAGE 0 — shared preprocessing (once)
+      xw   = x * hann(n)                              # reuse your cache
+      cmnd = shared_cmnd(xw, max_tau)                 # the O(N log N) FFT
+                                                      # autocorr + CMND.
+      # Already exists — just factor _difference() + CMND out of both
+      # yin.py:37-75 and mpm.py:37-73 into one helper.
+
+  STAGE 1 — cheap dual-pick (branches on same CMND, ~0.05 ms)
+      tau_yin, c_yin = yin_pick(cmnd, min_tau, max_tau, thr=0.07)  # + oct-down guard
+      tau_mpm, c_mpm = mpm_pick(cmnd, min_tau, max_tau, thr=0.25)  # + oct-up   guard
+      f_yin = sr / parabolic(cmnd, tau_yin)
+      f_mpm = sr / parabolic(cmnd, tau_mpm)
+
+  STAGE 2 — agreement gate (1 comparison)
+      d_st = |12 * log2(f_yin / f_mpm)|
+      IF d_st < 1.0:                      # they agree → almost certainly right
+          f0   = 0.5 * (f_yin + f_mpm)    # both refine to sub-cent precision
+          conf = max(c_yin, c_mpm)
+          source = "acf_agree"            # no Melodia needed this hop
+          GOTO post
+      # else: they disagree → almost always by an octave. Fall through.
+
+  STAGE 3 — harmonic arbiter (only when ACF pair disagrees, ≈ 5–15 % of hops)
+      f_mel, c_mel, _ = melodia_pitch(x, sr, fmin, fmax)   # runs its own FFT
+      # Resolve: pick the ACF candidate closest (in log-Hz) to f_mel.
+      f0 = argmin_{f ∈ {f_yin, f_mpm}} |log2(f / f_mel)|
+      conf = 0.85 * max(c_yin, c_mpm)     # slight penalty — we weren't sure
+      source = "melodia_arbit"
+      # Optionally: if f_mel disagrees with BOTH by >0.5 st AND c_mel > 0.4,
+      # use f_mel directly (spectral evidence trumps contested ACF).
+
+  POST — single post-processor
+      out = _SharedPitchPostProcessor.process(f0, conf, x)
+      # Your existing median/EMA/octave-lock/hold chain. It works on the
+      # FUSED result, so all three estimators share one temporal state.
+      # Add `source` to PitchResult.debug so the HUD can show which path
+      # fired — invaluable for tuning.
+
+  Compute per hop:
+      STAGE 0+1+2:  ~1.0–1.5 ms  (one FFT, two picks, a compare)
+      STAGE 3:      +1.5–3.0 ms  (second FFT + harmonic scan)
+      Expected:     ~1.2–1.8 ms  (stage 3 fires on ~10 % of hops)
+      Worst case:   ~4.5 ms      (flat, no spikes — bounded)
+
+  Compare to naive (b):  ~3–5 ms every hop → we're 2–3x cheaper.
+  Compare to (a):        ~same average, but NO latency spikes and NO
+                         silent-subharmonic failure.
+
+  Why this works:
+    - Two time-domain estimators with opposite octave biases form a bracket.
+    - One frequency-domain estimator breaks ties with DECORRELATED evidence.
+    - Fusion happens BEFORE temporal post-processing, so the median/EMA
+      chain sees a single clean stream instead of three jittery ones.
+    - Confidence semantics stay pure: the output conf is always the ACF
+      periodicity score (comparable frame-to-frame for the renderer's
+      line-width mapping).
+
+--------------------------------------------------------------------------------
+5. OPTION (c) — Port to WASM
+--------------------------------------------------------------------------------
+5.1  What moves to WASM and why
+
+  WASM buys you ONE thing: eliminating network RTT (stages E + I in the
+  v1 latency budget). On localhost those stages are ~1 ms combined; on
+  WAN they're 30–80 ms. So:
+
+      Deployment      RTT cost    WASM worth it?
+      ──────────────  ──────────  ────────────────────────────────
+      localhost       ~1 ms       No. You'd save 1 ms and pay for it
+                                  with weeks of dev + dual maintenance.
+      LAN             ~5 ms       Marginal. Probably no.
+      WAN             30–80 ms    Yes — this is the only case.
+
+5.2  If WAN is required — which of the three to port?
+
+  MPM — YES.   ~200 LOC counting dsp helpers. Maps cleanly to JS
+               TypedArrays. FFT via an existing WASM lib (kissfft-wasm,
+               fft.js with WASM backend, or Web Audio's AnalyserNode for
+               a rougher version). ~2 days to port + test.
+
+  YIN — NO.    Don't port YIN separately. Port the shared CMND kernel
+               (§4.2 STAGE 0) and both picks — they become one module.
+               Marginal cost over porting MPM alone: ~30 LOC.
+
+  Melodia — NO initially. It's the heaviest (4096+ FFT, 8× harmonic
+               interp loop) and it's the arbiter, not the primary. For
+               the WASM build, fall back to a simpler heuristic when
+               ACF pair disagrees: "pick the candidate whose half-
+               frequency has LESS spectral energy" — one extra FFT
+               lookup, ~20 LOC, gets you 80 % of the benefit.
+
+5.3  Hybrid topology for WAN
+
+    Browser (WASM)                            Server (Python)
+    ┌────────────────────────────┐            ┌──────────────────────┐
+    │ AudioWorklet → CMND.wasm   │            │ Still runs, still    │
+    │   → dual-pick → fast f0    │   JSON     │ listens.             │
+    │   → NoteFeed → Canvas      │ ◀───────── │ Melodia + pyworld    │
+    │   (draws at ~15 ms total)  │  every Kth │ every Kth hop as     │
+    │                            │   hop      │ octave oracle.       │
+    │ WS still open, sends       │ ─────────▶ │ Reply ADVISORY only  │
+    │ every Kth hop (K=4..8)     │  binary    │ (client ignores if   │
+    │                            │            │  >100 ms stale).     │
+    └────────────────────────────┘            └──────────────────────┘
+
+    - Client is AUTHORITATIVE for drawing. Server is advisory.
+    - Client checks each advisory reply against its own NoteFeed history;
+      if the server says "hop N was octave-wrong" and |t_now - t_N| < 300 ms,
+      client retroactively FIXES the piano-roll (cheap: repaint a 300 ms
+      strip).
+    - This gets you WASM-class latency + Python-class accuracy, without
+      a full port.
+
+5.4  Implementation cost
+
+      Option                      Effort      Maintenance
+      ────────────────────────── ──────────  ────────────────────────
+      (b) cascaded consensus,    small —     low — one codebase,
+          server-only            refactor    shares all existing
+                                 CMND + one  PostProcessor state.
+                                 fuse fn.
+      (c) full WASM, 3 algos     large —     high — two implementations
+                                 port + FFT  to keep in sync forever.
+                                 lib + test.
+      (c') hybrid WASM MPM +     medium —    medium — WASM MPM is stable
+           server oracle         one port +  once done; server code
+                                 advisory    unchanged.
+                                 protocol.
+
+--------------------------------------------------------------------------------
+6. CONCRETE DECISION TREE
+--------------------------------------------------------------------------------
+
+  Is your deployment localhost / LAN?
+  │
+  ├─ YES ─→ Implement (b) cascaded consensus in Python.
+  │         Network is ~free. One codebase. Done.
+  │         Total per-hop: ~1.5 ms avg, ~4.5 ms worst.
+  │         Fits the 80 ms budget with ~50 ms of headroom.
+  │
+  └─ NO (WAN) ─→ Implement (b) server-side FIRST anyway.
+                 Then port the shared CMND kernel + dual-pick to WASM (c').
+                 Server becomes advisory oracle.
+                 Do NOT port Melodia; use simplified spectral tie-break.
+
+  Never choose (a). The silent subharmonic failure + latency jitter +
+  branchy refinement logic make it strictly worse than (b) for equal cost.
+
+  Never port ALL THREE to WASM. Melodia's benefit is as a DECORRELATED
+  arbiter — you only need it 10 % of the time, and a cheap spectral
+  check substitutes adequately in the browser.
+
+--------------------------------------------------------------------------------
+7. SKETCH — fuse_pitch() drop-in for RealtimePitchState.process_chunk()
+--------------------------------------------------------------------------------
+  def fuse_pitch(x, sr, fmin, fmax, melodia_cache):
+      # STAGE 0 — shared CMND (factored out of yin.py / mpm.py)
+      cmnd, xw, max_tau, min_tau = shared_cmnd(x, sr, fmin, fmax)
+
+      # STAGE 1 — two picks on same CMND
+      f_yin, c_yin = _yin_pick(cmnd, min_tau, max_tau, sr)   # threshold 0.07,
+                                                             # oct-down guard
+      f_mpm, c_mpm = _mpm_pick(cmnd, min_tau, max_tau, sr)   # threshold 0.25,
+                                                             # oct-up guard
+
+      # STAGE 2 — agreement gate
+      if f_yin and f_mpm and abs(12*log2(f_yin/f_mpm)) < 1.0:
+          return (0.5*(f_yin+f_mpm), max(c_yin, c_mpm), "acf_agree")
+
+      # STAGE 3 — Melodia arbiter (lazy — only when disagreement)
+      f_mel, c_mel, _ = melodia_pitch(x, sr, fmin, fmax)
+      cands = [c for c in (f_yin, f_mpm) if c is not None]
+      if f_mel and cands:
+          f0 = min(cands, key=lambda f: abs(log2(f/f_mel)))
+          return (f0, 0.85*max(c_yin or 0, c_mpm or 0), "melodia_arbit")
+
+      # Degenerate — everything disagreed or unvoiced
+      return (f_mpm or f_yin or f_mel,
+              max(c_mpm, c_yin, c_mel) * 0.6, "weak")
+
+  # In RealtimePitchState.process_chunk():
+  #   f0, conf, source = fuse_pitch(...)
+  #   result = self.fuse_post.process(f0, conf, x)   # ONE post-processor
+  #   result.debug = {"source": source}
+
+--------------------------------------------------------------------------------
+8. TL;DR
+--------------------------------------------------------------------------------
+  (a) MPM primary + refine   → rejected. Silent failures, jitter, branchy.
+  (b) Consensus              → yes, but as CASCADED consensus, not naive
+                               parallel. ~1.5 ms avg, bounded worst case.
+                               Costs barely more than MPM alone thanks to
+                               shared CMND.
+  (c) WASM                   → only for WAN, only port the CMND kernel +
+                               dual-pick. Server stays as advisory oracle.
+                               Do not port Melodia.
+
+  Build (b) first. It's a small refactor of code you already have.
+================================================================================

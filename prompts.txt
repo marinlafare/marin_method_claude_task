@@ -1,0 +1,69 @@
+I PROMPT
+
+ I have a collection of f0 estimators in the realtime_pitch/operations folder.
+  I want you to tell me the best architecture design to make them work through a web interface.
+  Since the process is about audio signal detection, have in mind the delays from the user microphone
+  and the delays of preprocess-process-postprocess.
+  The goal would be for the user to be able to watch the notes from their voice in a viewport
+  "cumulative record" style
+  in "real time" or, understandably, the shortest time delta possible.
+
+  Write your response in a txt file in the root of the repo called: architecture_v1.txt
+
+II PROMPT
+
+I hear what you said. Tell me what you think about these options:
+a) I could have the MPM algorithm as "ground truth" and YIN and Melodia serving as "refinement" for it.
+b) I could have three algorithms running at the same time: MPM, YIN, and Melodia, and serve the result of their consensus.
+What would be best considering the time delays and the implementation?
+c) should all of them be transformed to WASM?
+
+
+Write your response in a txt file in the root of the repo called: architecture_v2.txt
+
+III PROMPT
+
+I missed you last response, i'm repeating the prompt, please repeate the answer but this time
+Write your response in a txt file in the root of the repo called: architecture_v3.txt
+
+OK, so let's say i implement MPM as WASM in the browser, and I have Melodia in the server as octave refinement.
+Tell me what would be the best to implement:
+a) One docker app with the server and the webUI
+b) Two docker apps one for the server and one for the webUI
+c) One docker app for the webui and one local implementation for the backend
+d) No docker apps, and the whole system implemented locally
+Taking into account that the system would be in a webpage for a remote user, what would be the best architecture to implement it?
+
+Write your response in a txt file in the root of the repo called: architecture_v3.txt
+
+IV PROMPT
+
+
+Ok, so one docker app, MPM as WASM in the browser.                                                     
+  So now, The main user mode will be to have a teacher and a student,                                     
+  the teacher knows about singing and the student is learning the craft.                                 
+  The teacher and the student enters both at the same session, the teacher can see the viewport with     
+  the result of the student singing,                                                                     
+  currently we have no user signing sessions,                                                            
+  so tell me: what would be the best architecture to have:                                               
+  a) student-teacher cojoint session,                                                                    
+  b) what would be the best structure to not compromise the delays                                       
+  c) what would be the best features for the teacher                                                     
+  d) what would be the best features to the student                                                      
+                                                                                                         
+  Write your response in a txt file in the root of the repo called: architecture_v4.txt     
+
+  V PROMPT
+
+  So i think the teacher should need to create an account, 
+  so it can save the information of their students and the excercises he/she creates,
+  I'm thinking a simple PostgreSQL in the docker,
+  What would be the best architecture for the models of the teacher,
+  each teacher should have students, exercises, and notes for each student.
+  Students i think, do not need to create a user, they can have a 'key' given by the teacher.
+
+  Write your response in a txt file in the root of the repo called: architecture_v5.txt 
+
+
+VI PROMPT
+about web RTC

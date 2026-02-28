@@ -1,0 +1,585 @@
+================================================================================
+REALTIME PITCH — ARCHITECTURE v5
+Teacher accounts, student keys, PostgreSQL data model, exercises, notes.
+================================================================================
+
+Context from prior decisions:
+  - Single Docker container (v3).  Now adds a PostgreSQL container →
+    docker-compose with two services: app + db.
+  - MPM WASM in browser, Melodia advisory on server (v2/v3).
+  - Session via shareable link, teacher observes student real-time (v4).
+  - Teacher needs persistent state.  Student does NOT create an account.
+
+================================================================================
+PART 1 — AUTH MODEL
+================================================================================
+
+--------------------------------------------------------------------------------
+1.1  TEACHER: account-based
+--------------------------------------------------------------------------------
+Teacher registers with email + password.  Minimal.
+
+  - Email:    used for login and password reset (later).  Unique.
+  - Password: bcrypt-hashed, 12 rounds.  Never stored plain.
+  - Auth:     HTTP-only secure cookie carrying a signed JWT (or a session
+              token).  NOT localStorage JWT — that's XSS-vulnerable.
+
+  Flow:
+    POST /api/auth/register   {"email", "password", "display_name"}
+    POST /api/auth/login      {"email", "password"}  → Set-Cookie: session=...
+    POST /api/auth/logout     → clears cookie
+    GET  /api/auth/me         → current teacher profile (from cookie)
+
+  Password hashing: passlib[bcrypt] or python-bcrypt.
+  Session token: a signed, expiring token (itsdangerous TimedSerializer or
+  PyJWT with HS256 + server secret).  Expiry: 7 days.  No refresh token
+  needed at this scale — re-login is fine.
+
+  Why a cookie and not a Bearer token:
+    - The WebSocket upgrade request cannot carry an Authorization header from
+      the browser.  It CAN carry cookies.  Since the teacher's WS needs
+      auth (to prove they own the session room), cookies are the only
+      mechanism that works seamlessly for both HTTP and WS.
+    - Same-origin (v3 decision) means SameSite=Strict works and no CSRF
+      token is needed for state-changing POSTs.  (Add one later if you
+      ever go cross-origin.)
+
+--------------------------------------------------------------------------------
+1.2  STUDENT: key-based, no account
+--------------------------------------------------------------------------------
+The teacher creates a student record and gets a student_key — a short,
+human-readable, single-use-per-session token.
+
+  student_key format:  8 characters, base32 (A-Z, 2-7), case-insensitive.
+                       e.g. "KBXW43TN"
+                       → 40 bits of entropy, 1.1 trillion combinations.
+                       Easy to dictate in a lesson.  Easy to type on a phone.
+
+  The student_key is NOT a session_id.  The session_id (v4) is ephemeral
+  and identifies a live WS session.  The student_key identifies a PERSON
+  across multiple sessions.
+
+  Flow:
+    1. Teacher creates student in dashboard → gets student_key "KBXW43TN".
+    2. Teacher tells student: "go to domain.com and enter KBXW43TN."
+    3. Student opens /, enters key (one input field, no registration).
+    4. Student browser: POST /api/student/auth  {"key": "KBXW43TN"}
+         → server validates key, returns Set-Cookie: student_session=...
+         → also returns {student_id, display_name, teacher_display_name}.
+    5. Student opens WS with the cookie.  Server resolves student_id from
+       the cookie, creates a SessionRoom, and auto-notifies the teacher's
+       dashboard ("Juan is online").
+    6. Teacher clicks "Join" → their WS joins the SessionRoom as observer.
+
+  The student_key can be:
+    - PERMANENT (reusable across lessons, like a student ID card).
+    - REVOCABLE (teacher deactivates it if a student leaves).
+    - NOT expiring by default — the teacher controls the lifecycle.
+
+  Why not a session link like v4?
+    v4's nanoid link was for the no-auth world.  Now that teachers have
+    accounts, the student_key ties pitch history to a named student record.
+    The teacher doesn't want to manually correlate "which anonymous
+    session was Juan's?" — the key does it automatically.
+
+  The v4 shareable link still works as a FALLBACK for guests / demos:
+    - If someone opens /s/{session_id} without a student_key, they get
+      the anonymous experience (v4).  No persistence.
+    - If they open / and enter a student_key, they get the persistent
+      experience.  All their sessions are logged under their student record.
+
+================================================================================
+PART 2 — POSTGRESQL DATA MODEL
+================================================================================
+
+--------------------------------------------------------------------------------
+2.1  WHY POSTGRES IN THE DOCKER COMPOSE
+--------------------------------------------------------------------------------
+  - You need relational integrity (teacher → students → exercises →
+    session logs → notes).  This is textbook relational data.
+  - SQLite would work for 1 teacher, but not for concurrent writes from
+    multiple teacher dashboards.  Postgres handles this correctly.
+  - Postgres in Docker is a single image (postgres:16-alpine, ~80 MB).
+    No external service to manage.
+  - For a future move to managed Postgres (RDS, Supabase, Neon), the
+    migration is: change the DATABASE_URL env var.  Zero code change.
+
+  docker-compose.yml:
+    services:
+      db:
+        image: postgres:16-alpine
+        environment:
+          POSTGRES_USER: rtpitch
+          POSTGRES_PASSWORD: ${DB_PASSWORD}
+          POSTGRES_DB: rtpitch
+        volumes:
+          - pgdata:/var/lib/postgresql/data
+        ports: []   # NOT exposed to host; only app talks to it.
+      app:
+        build: .
+        depends_on: [db]
+        environment:
+          DATABASE_URL: postgresql+asyncpg://rtpitch:${DB_PASSWORD}@db:5432/rtpitch
+        ports:
+          - "8000:8000"
+    volumes:
+      pgdata:
+
+  ORM: SQLAlchemy 2.0 (async, via asyncpg driver).
+  Migrations: Alembic.
+  Added to requirements.txt:
+    sqlalchemy[asyncio]==2.0.*
+    asyncpg==0.29.*
+    alembic==1.13.*
+    passlib[bcrypt]==1.7.*
+    python-jose[cryptography]==3.3.*   # JWT signing
+
+--------------------------------------------------------------------------------
+2.2  TABLES
+--------------------------------------------------------------------------------
+
+  ┌─────────────┐       ┌──────────────┐       ┌──────────────────┐
+  │  teacher     │       │  student     │       │  exercise        │
+  ├─────────────┤       ├──────────────┤       ├──────────────────┤
+  │ id (PK)     │──┐    │ id (PK)      │    ┌──│ id (PK)          │
+  │ email       │  │    │ teacher_id(FK)│←─┐│  │ teacher_id (FK)  │←─┐
+  │ password_h  │  │    │ display_name │  ││  │ title            │  │
+  │ display_name│  │    │ key          │  ││  │ description      │  │
+  │ created_at  │  │    │ active (bool)│  ││  │ target_contour   │  │
+  │ updated_at  │  │    │ created_at   │  ││  │ reference_f0s    │  │
+  └─────────────┘  │    │ updated_at   │  ││  │ tempo_bpm        │  │
+                   │    └──────────────┘  ││  │ created_at       │  │
+                   │                      ││  │ updated_at       │  │
+                   │    ┌──────────────┐  ││  └──────────────────┘  │
+                   │    │ session_log  │  ││                        │
+                   │    ├──────────────┤  ││  ┌──────────────────┐  │
+                   │    │ id (PK)      │  ││  │ student_note     │  │
+                   │    │ student_id(FK)│←─┘│  ├──────────────────┤  │
+                   │    │ teacher_id(FK)│←──┘  │ id (PK)          │  │
+                   └───→│ exercise_id  │(FK)──→│ student_id (FK)  │  │
+                        │ started_at   │      │ teacher_id (FK)  │  │
+                        │ ended_at     │      │ session_log_id   │(FK)
+                        │ pitch_data   │      │ content          │  │
+                        │ markers      │      │ created_at       │  │
+                        │ summary_json │      │ updated_at       │  │
+                        │ created_at   │      └──────────────────┘  │
+                        └──────────────┘                            │
+                                                                    │
+                        ┌──────────────────┐                        │
+                        │ exercise_assign  │                        │
+                        ├──────────────────┤                        │
+                        │ id (PK)          │                        │
+                        │ student_id (FK)  │                        │
+                        │ exercise_id (FK) │────────────────────────┘
+                        │ assigned_at      │
+                        │ due_date         │(nullable)
+                        │ status           │(pending/in_progress/done)
+                        └──────────────────┘
+
+--------------------------------------------------------------------------------
+2.3  TABLE DETAILS
+--------------------------------------------------------------------------------
+
+── teacher ────────────────────────────────────────────────────────────────
+
+  Column         Type            Notes
+  ─────────────  ──────────────  ──────────────────────────────────────
+  id             UUID            PK, gen_random_uuid() default.
+  email          VARCHAR(255)    UNIQUE, NOT NULL.  Lowercase, trimmed.
+  password_hash  VARCHAR(128)    bcrypt output.  NOT NULL.
+  display_name   VARCHAR(100)    Shown to students.
+  created_at     TIMESTAMPTZ     DEFAULT now().
+  updated_at     TIMESTAMPTZ     DEFAULT now(), auto-update trigger.
+
+  Index: UNIQUE on lower(email).
+
+── student ────────────────────────────────────────────────────────────────
+
+  Column         Type            Notes
+  ─────────────  ──────────────  ──────────────────────────────────────
+  id             UUID            PK.
+  teacher_id     UUID            FK → teacher.id, NOT NULL, ON DELETE CASCADE.
+  display_name   VARCHAR(100)    Teacher-assigned name ("Juan", "Soprano 3").
+  key            VARCHAR(8)      UNIQUE, NOT NULL.  Base32, generated by
+                                 server.  Case-insensitive lookup via
+                                 UPPER(key).
+  voice_range    VARCHAR(20)     Nullable.  "soprano" | "alto" | "tenor" |
+                                 "baritone" | "bass" | null.
+                                 Informational; optionally used to set
+                                 fmin/fmax defaults in the session.
+  active         BOOLEAN         DEFAULT true.  Teacher flips to false
+                                 to revoke access without deleting history.
+  created_at     TIMESTAMPTZ
+  updated_at     TIMESTAMPTZ
+
+  Indexes: UNIQUE on key.  INDEX on teacher_id (list students).
+  CHECK: key ~ '^[A-Z2-7]{8}$'.
+
+── exercise ───────────────────────────────────────────────────────────────
+
+  Column           Type            Notes
+  ───────────────  ──────────────  ──────────────────────────────────────
+  id               UUID            PK.
+  teacher_id       UUID            FK → teacher.id, NOT NULL.
+  title            VARCHAR(200)    "C major scale ascending", "Nessun Dorma
+                                    opening phrase".
+  description      TEXT            Nullable.  Free-form instructions.
+  target_contour   JSONB           The target melody the student should
+                                   match.  Array of:
+                                   [{"t": 0.0, "dur": 0.5, "midi": 60.0,
+                                     "label": "C4"}, ...]
+                                   This is what v4 called "teacher draws
+                                   a reference" — now it's persisted.
+  reference_f0s    JSONB           Nullable.  If the teacher recorded the
+                                   exercise by singing it, store the raw
+                                   pitch trace: [{t, midi, conf}, ...].
+                                   Optional — for playback-as-reference.
+  tempo_bpm        REAL            Nullable.  If the exercise has a tempo,
+                                   used to scale target_contour playback.
+  fmin_hz          REAL            Nullable.  Override session fmin for
+                                   this exercise (e.g., 80 Hz for bass).
+  fmax_hz          REAL            Nullable.  Override session fmax.
+  tags             TEXT[]          Nullable.  Postgres array: ["scales",
+                                   "warmup", "breath_control"].
+  created_at       TIMESTAMPTZ
+  updated_at       TIMESTAMPTZ
+
+  Index: INDEX on teacher_id.  GIN on tags (for filtering).
+
+  Why JSONB for target_contour and reference_f0s:
+    - These are variable-length arrays of float tuples.  Normalizing them
+      into separate tables (exercise_note, exercise_pitch_sample) would
+      create millions of rows for no querying benefit — you never
+      SELECT WHERE midi > 60.  You always load the entire contour.
+    - JSONB supports containment queries (@>) if you ever need filtering.
+    - Postgres 16 JSONB is fast for reads; these columns are write-once,
+      read-many.
+
+── exercise_assign ────────────────────────────────────────────────────────
+
+  Column         Type            Notes
+  ─────────────  ──────────────  ──────────────────────────────────────
+  id             UUID            PK.
+  student_id     UUID            FK → student.id, NOT NULL.
+  exercise_id    UUID            FK → exercise.id, NOT NULL.
+  assigned_at    TIMESTAMPTZ     DEFAULT now().
+  due_date       DATE            Nullable.  Teacher can set a deadline.
+  status         VARCHAR(20)     'pending' | 'in_progress' | 'completed'.
+                                 DEFAULT 'pending'.
+
+  Index: UNIQUE on (student_id, exercise_id).  (A student gets each
+         exercise at most once.  Re-assign = reset status.)
+  Index: INDEX on student_id (student's exercise list).
+
+  This is a join table that answers:
+    - Teacher: "which exercises has Juan done?"
+    - Student: "what should I practice today?"
+
+── session_log ────────────────────────────────────────────────────────────
+
+  Column         Type            Notes
+  ─────────────  ──────────────  ──────────────────────────────────────
+  id             UUID            PK.
+  student_id     UUID            FK → student.id, NOT NULL.
+  teacher_id     UUID            FK → teacher.id.  Nullable — solo
+                                 practice sessions have no teacher.
+  exercise_id    UUID            FK → exercise.id.  Nullable — free-form
+                                 sessions (just singing, no exercise).
+  started_at     TIMESTAMPTZ     NOT NULL.
+  ended_at       TIMESTAMPTZ     Nullable (filled on session close).
+  duration_s     REAL            Computed: ended_at - started_at.
+  pitch_data     JSONB           The student_note_log from v4, snapshotted
+                                 at session end:
+                                 [{seq, t, midi, conf, voiced, source}, ...]
+                                 ~500 KB for 30 min.  Compress at rest:
+                                 consider JSONB + lz4 column compression
+                                 (Postgres 14+ TOAST compression = lz4).
+  markers        JSONB           Teacher markers from v4 §c.3:
+                                 [{t, kind, text}, ...]
+  summary_json   JSONB           Computed at session end:
+                                 {avg_cents_off, pct_in_tune, pct_voiced,
+                                  range_low_midi, range_high_midi,
+                                  exercise_score (if exercise)}.
+  created_at     TIMESTAMPTZ
+
+  Index: INDEX on student_id, started_at DESC (student history).
+  Index: INDEX on teacher_id, started_at DESC (teacher dashboard).
+  Index: INDEX on exercise_id (exercise performance history).
+
+  Size estimate:
+    30-min session @ 47 hops/s = ~85 000 pitch events.
+    Each event ≈ 60 bytes JSON.  Total ≈ 5 MB uncompressed JSONB.
+    With lz4 TOAST: ~1.5 MB.  10 sessions/day × 365 days = ~5.5 GB/year.
+    Postgres handles this trivially.  Partition by year if it ever matters.
+
+── student_note ───────────────────────────────────────────────────────────
+
+  Column          Type            Notes
+  ──────────────  ──────────────  ──────────────────────────────────────
+  id              UUID            PK.
+  student_id      UUID            FK → student.id, NOT NULL.
+  teacher_id      UUID            FK → teacher.id, NOT NULL.
+  session_log_id  UUID            FK → session_log.id, nullable (note can
+                                  exist independent of a session — e.g.
+                                  teacher writes a note about a student
+                                  from memory).
+  content         TEXT            Free-form teacher notes:
+                                  "Juan struggles with the passaggio
+                                   around D4-F4.  Try lighter registration."
+  created_at      TIMESTAMPTZ
+  updated_at      TIMESTAMPTZ
+
+  Index: INDEX on student_id, created_at DESC.
+
+  This is the teacher's private notebook per student.  Not shown to the
+  student.  Simple append-only text entries, optionally linked to a
+  specific session for context.
+
+================================================================================
+PART 3 — API ROUTES
+================================================================================
+
+  All /api/teacher/* routes require teacher auth cookie.
+  All /api/student/* routes require student session cookie.
+
+  ── Auth ───────────────────────────────────────────────────
+  POST   /api/auth/register          create teacher account
+  POST   /api/auth/login             teacher login → set cookie
+  POST   /api/auth/logout            clear cookie
+  GET    /api/auth/me                current teacher info
+
+  ── Student auth ───────────────────────────────────────────
+  POST   /api/student/auth           {"key": "KBXW43TN"} → set cookie
+
+  ── Teacher → Students ─────────────────────────────────────
+  GET    /api/teacher/students           list my students
+  POST   /api/teacher/students           create student → returns key
+  PATCH  /api/teacher/students/:id       update name, voice_range, active
+  DELETE /api/teacher/students/:id       soft-delete (active=false)
+  POST   /api/teacher/students/:id/rekey generate new key (revoke old)
+
+  ── Teacher → Exercises ────────────────────────────────────
+  GET    /api/teacher/exercises          list my exercises
+  POST   /api/teacher/exercises          create exercise
+  GET    /api/teacher/exercises/:id      get exercise detail
+  PATCH  /api/teacher/exercises/:id      update exercise
+  DELETE /api/teacher/exercises/:id      delete exercise
+
+  ── Teacher → Assignments ──────────────────────────────────
+  POST   /api/teacher/students/:sid/assign    assign exercise to student
+  GET    /api/teacher/students/:sid/assignments  student's assigned exercises
+  PATCH  /api/teacher/assignments/:id         update status / due_date
+
+  ── Teacher → Notes ────────────────────────────────────────
+  GET    /api/teacher/students/:sid/notes     notes for a student
+  POST   /api/teacher/students/:sid/notes     add note
+  PATCH  /api/teacher/notes/:id               edit note
+  DELETE /api/teacher/notes/:id               delete note
+
+  ── Teacher → Session history ──────────────────────────────
+  GET    /api/teacher/students/:sid/sessions  session logs for a student
+  GET    /api/teacher/sessions/:id            full session detail (pitch_data,
+                                              markers, summary)
+
+  ── Student ────────────────────────────────────────────────
+  GET    /api/student/me                      my profile (name, teacher name)
+  GET    /api/student/assignments             my assigned exercises
+  GET    /api/student/sessions                my past session summaries
+                                              (summary_json only, NOT full
+                                               pitch_data — that's teacher-
+                                               facing for review)
+
+  ── WebSocket (updated from v4) ────────────────────────────
+  WS     /realtime/stream
+           First msg: {"role": "student", "student_key": "KBXW43TN", ...}
+                  or: {"role": "teacher", "student_id": "<uuid>", ...}
+                  or: {"role": "guest", ...}   (anonymous, no persistence)
+
+           Server resolves auth from cookie + first-msg role.
+           Creates/joins SessionRoom keyed by student_id (not session_id).
+           On session end: persists student_note_log → session_log table.
+
+================================================================================
+PART 4 — HOW SESSION PERSISTENCE WORKS
+================================================================================
+
+  Lifecycle of a lesson session:
+
+  1. Student enters key → /api/student/auth → cookie set, student_id known.
+  2. Student connects WS → server creates SessionRoom(student_id).
+     Server creates session_log row: {student_id, started_at=now()}.
+     If the student selected an exercise in the UI, exercise_id is set.
+  3. Pitch events flow as in v4.  Server accumulates in-memory
+     student_note_log (deque, last 300s for live relay to teacher).
+     ALSO: server appends to a write-ahead buffer (list, unbounded for
+     the session duration).
+  4. Teacher joins → server backfills from student_note_log, then streams
+     live.  Teacher markers go to both in-memory log and the write-ahead
+     buffer.
+  5. Session ends (student disconnects, or teacher clicks "end session",
+     or 5-min inactivity timeout).
+     Server:
+       a) Computes summary_json (avg_cents_off, pct_in_tune, ...).
+       b) Writes pitch_data + markers + summary_json to session_log row.
+       c) Updates ended_at, duration_s.
+       d) If exercise was assigned, updates exercise_assign.status.
+       e) Clears in-memory SessionRoom.
+
+  Write-ahead buffer vs. streaming to Postgres:
+    Do NOT write each pitch event to Postgres individually (47 inserts/s
+    per user = noisy and pointless for data you only read in bulk).
+    Buffer in memory, flush once on session end.  If the server crashes
+    mid-session, that session's pitch data is lost — acceptable for a
+    teaching tool.  If you want crash safety later, write the buffer to
+    a local file every 30s and import on recovery.
+
+================================================================================
+PART 5 — WHAT THE TEACHER DASHBOARD LOOKS LIKE (wireframe)
+================================================================================
+
+  ┌─ Teacher Dashboard ──────────────────────────────────────────────┐
+  │                                                                   │
+  │  ┌─ Students ──────────────┐  ┌─ Exercises ──────────────────┐   │
+  │  │ ● Juan       (online)   │  │  C Major Scale               │   │
+  │  │   A3–D5 • tenor         │  │  Arpeggio Warm-up            │   │
+  │  │   Key: KBXW43TN         │  │  Breath Control Long Tone    │   │
+  │  │   Last session: 2h ago  │  │  + New Exercise              │   │
+  │  │                         │  │                              │   │
+  │  │   Maria     (offline)   │  └──────────────────────────────┘   │
+  │  │   C4–A5 • soprano       │                                     │
+  │  │   Key: TRM2BFYH         │  ┌─ Selected: Juan ────────────┐   │
+  │  │   Last session: 3d ago  │  │                              │   │
+  │  │                         │  │  Assignments:                │   │
+  │  │ + Add Student           │  │  ✓ C Major Scale (done)      │   │
+  │  └─────────────────────────┘  │  ◷ Arpeggio Warm-up (due Fri)│  │
+  │                               │  ○ Breath Control (pending)  │   │
+  │  ┌─ Notes on Juan ────────┐  │                              │   │
+  │  │ Feb 27: Passaggio at   │  │  Sessions:                   │   │
+  │  │ D4-F4 still tight.     │  │  Feb 27 14:00 (32 min)       │   │
+  │  │ Try lighter mix.       │  │    → 78% in tune, C Major ex  │   │
+  │  │                        │  │  Feb 25 10:00 (45 min)       │   │
+  │  │ Feb 25: Good progress  │  │    → 84% in tune, free-form  │   │
+  │  │ on breath support.     │  │                              │   │
+  │  │                        │  │  [Join Session]  (if online) │   │
+  │  │ + Add Note             │  │  [Review Last Session]        │   │
+  │  └────────────────────────┘  └──────────────────────────────┘   │
+  │                                                                   │
+  └───────────────────────────────────────────────────────────────────┘
+
+  "Join Session" → opens the v4 teacher viewport (scrolling piano-roll,
+  overlays, markers) in a new panel or fullscreen.
+
+  "Review Last Session" → same piano-roll viewport but with seek/scrub
+  (playback of pitch_data from session_log), markers displayed, summary
+  stats shown.
+
+================================================================================
+PART 6 — DOCKER COMPOSE (updated from v3)
+================================================================================
+
+  # docker-compose.yml
+  services:
+    db:
+      image: postgres:16-alpine
+      restart: unless-stopped
+      environment:
+        POSTGRES_USER: rtpitch
+        POSTGRES_PASSWORD: ${DB_PASSWORD}
+        POSTGRES_DB: rtpitch
+      volumes:
+        - pgdata:/var/lib/postgresql/data
+      healthcheck:
+        test: ["CMD-SHELL", "pg_isready -U rtpitch"]
+        interval: 5s
+        retries: 5
+
+    app:
+      build: .
+      restart: unless-stopped
+      depends_on:
+        db:
+          condition: service_healthy
+      environment:
+        DATABASE_URL: postgresql+asyncpg://rtpitch:${DB_PASSWORD}@db:5432/rtpitch
+        SECRET_KEY: ${SECRET_KEY}          # for JWT/cookie signing
+        ENVIRONMENT: production
+      ports:
+        - "8000:8000"
+
+  volumes:
+    pgdata:
+
+  The app container runs Alembic migrations on startup (entrypoint script):
+    #!/bin/sh
+    alembic upgrade head
+    exec uvicorn realtime_pitch.main:app --host 0.0.0.0 --port 8000
+
+  Dockerfile changes from v3:
+    - Add sqlalchemy, asyncpg, alembic, passlib, python-jose to
+      requirements.txt and the pip install layer.
+    - COPY alembic/ and alembic.ini into the image.
+
+================================================================================
+PART 7 — SECURITY NOTES
+================================================================================
+
+  7.1  Student key brute-force protection
+       8 base32 chars = 40 bits.  At 1000 guesses/s an attacker needs
+       ~35 years.  BUT: add rate limiting on /api/student/auth anyway.
+       5 attempts per IP per minute.  After 20 failures, block the IP
+       for 1 hour.  Use a simple in-memory counter (or Redis if you add
+       one later).  FastAPI has slowapi for this.
+
+  7.2  Teacher password brute-force
+       Same rate limiting on /api/auth/login.  bcrypt's 12 rounds already
+       costs ~250 ms per hash, making bulk guessing impractical.
+
+  7.3  Student key as a capability
+       The key grants access to: join a session as that student, view
+       own assignments, view own session summaries.  It does NOT grant:
+       viewing other students, viewing teacher notes, modifying exercises.
+       This is enforced by the API (student routes only return data for
+       the authenticated student_id).
+
+  7.4  Teacher ownership isolation
+       Every query includes WHERE teacher_id = <current_teacher>.  A teacher
+       cannot see another teacher's students, exercises, or sessions.
+       This is enforced at the query level (SQLAlchemy relationship
+       filters), not at the route level alone.
+
+  7.5  pitch_data is NOT audio
+       session_log.pitch_data contains only {midi, conf, voiced} tuples.
+       No raw audio is ever stored.  This is a privacy advantage — there
+       is nothing to leak that could reconstruct the student's voice.
+
+================================================================================
+PART 8 — WHAT TO BUILD (ordered)
+================================================================================
+
+  PHASE 1 — Teacher accounts + student keys
+    1. Postgres + SQLAlchemy models + Alembic initial migration.
+    2. /api/auth/* routes (register, login, logout, me).
+    3. /api/teacher/students (CRUD + key generation).
+    4. /api/student/auth (key-based cookie).
+    5. Update /realtime/stream to resolve student_id from cookie and
+       create/join SessionRoom by student_id instead of session_id.
+    6. On session end: persist student_note_log → session_log.
+
+  PHASE 2 — Exercises
+    7. /api/teacher/exercises CRUD.
+    8. /api/teacher/students/:sid/assign (exercise assignment).
+    9. Exercise selector in student UI → loads target_contour, draws
+       on piano-roll as overlay.
+   10. Session end: compute summary_json, update assignment status.
+
+  PHASE 3 — Teacher notes + dashboard
+   11. /api/teacher/students/:sid/notes CRUD.
+   12. Teacher dashboard page (student list, assignments, session history,
+       notes).
+   13. Session review page (playback piano-roll with seek/scrub).
+
+  PHASE 4 — Polish
+   14. Rate limiting on auth endpoints.
+   15. Password reset via email (later — skip for MVP).
+   16. Student view of own session summaries + assignment list.
+================================================================================

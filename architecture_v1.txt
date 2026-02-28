@@ -1,0 +1,416 @@
+================================================================================
+REALTIME PITCH — WEB ARCHITECTURE v1
+Target: sub-80 ms perceived latency from mic → rendered note on a scrolling
+"cumulative record" viewport.
+================================================================================
+
+--------------------------------------------------------------------------------
+0. STARTING POINT (what we already have, assessed from realtime_pitch/)
+--------------------------------------------------------------------------------
+- FastAPI + uvicorn ASGI app, CORS open to localhost:5173.
+- WebSocket endpoint /realtime/stream:
+      first TEXT msg  -> JSON config  -> RealtimePitchState.apply_config()
+      BYTES msgs      -> int16le mono PCM -> RealtimePitchState.process_chunk()
+      reply per chunk -> {ok, f0_hz, confidence, note, t, engine_rev, ...}
+- 10 f0 estimators in operations/ (yin, yinfft, aubio_yin, mpm, bacf, obp,
+  melodia, swipe, pyworld, parselmouth). Uniform output: (f0_hz|None, conf).
+- Preprocessor (DC block, 1st-order HP/LP, optional pre-emphasis).
+- Post-processors (median, EMA, octave lock, jitter deadband, hold frames).
+- hz->midi->note_name helpers already exist.
+- No frontend shipped yet; only the backend service.
+
+The backbone is solid. The architecture below describes the MISSING frontend,
+the transport contract, the threading model, and the latency budget.
+
+--------------------------------------------------------------------------------
+1. HIGH-LEVEL TOPOLOGY
+--------------------------------------------------------------------------------
+
+  Browser (single SPA page)               Server (uvicorn worker)
+  ┌──────────────────────────┐            ┌──────────────────────────────┐
+  │ getUserMedia(audio)       │            │ FastAPI  /realtime/stream    │
+  │   ↓                       │            │   ↓                          │
+  │ AudioWorkletProcessor     │  binary    │ int16le -> float32 -> Pre    │
+  │  (128-frame quantum,      │ ─────────▶ │ proc -> estimator.process -> │
+  │   aggregate to hop_size)  │  WS        │ PostProc -> PitchResult      │
+  │   ↓ postMessage           │ ◀───────── │ JSON {f0_hz, conf, note, t}  │
+  │ Main thread WS.send(buf)  │  text      │ (run_in_threadpool)          │
+  │   ↓                       │            └──────────────────────────────┘
+  │ NoteFeed (ring buffer)    │
+  │   ↓  requestAnimationFrame│
+  │ CanvasRenderer            │
+  │  (scrolling piano-roll,   │
+  │   left-edge = "now")      │
+  └──────────────────────────┘
+
+Transport: plain WebSocket over TLS (wss://). No WebRTC, no SFU, no TURN.
+Rationale: we only need a one-way mono PCM stream of ~11–21 ms frames plus a
+tiny JSON reply. WebRTC adds AEC, Opus, jitter buffers — all of which fight us
+on latency for a pitch-detection use case. The existing int16le-over-WS
+contract in routers/stream.py is the correct choice; keep it.
+
+--------------------------------------------------------------------------------
+2. LATENCY BUDGET (the thing that actually matters)
+--------------------------------------------------------------------------------
+Target perceived latency: voice -> pixel < 80 ms. Breakdown:
+
+  Stage                               Typical     Notes
+  ──────────────────────────────────  ─────────   ────────────────────────────
+  A. Mic hardware + OS buffer         5–15 ms     Hardware dependent, not us.
+  B. AudioContext input latency       3–10 ms     latencyHint: "interactive".
+  C. AudioWorklet hop aggregation     hop/2 avg   We wait to fill one hop.
+                                                   hop=512  @48k → 5.3 ms avg
+                                                   hop=1024 @48k → 10.6 ms avg
+  D. Main-thread postMessage hop      <1 ms       Transferable ArrayBuffer.
+  E. WS network RTT / 2               0.5–20 ms   Localhost ≈ 0.5; LAN ≈ 2;
+                                                   WAN ≈ 15–40. Design for
+                                                   localhost/LAN first.
+  F. int16->float32 + Preprocessor    <0.5 ms     np.frombuffer + two IIRs.
+  G. Estimator compute                0.3–8 ms    See §4.  yin/mpm ≈ 1–3 ms,
+                                                   pyworld/parselmouth heavier.
+  H. PostProcessor (median/EMA/...)   <0.5 ms     Deque over 5 frames.
+  I. WS reply transport               same as E
+  J. NoteFeed push + rAF sync         0–16 ms     Worst case 1 frame @60fps.
+  ──────────────────────────────────  ─────────
+  Best case (localhost, hop=512)      ≈ 25–40 ms
+  Typical   (LAN,       hop=1024)     ≈ 45–70 ms
+  Worst acceptable (WAN, hop=1024)    ≈ 80–120 ms  → move estimator to WASM
+                                                     (see §8 fallback)
+
+Two knobs control almost everything:
+  - hop_size (samples)  → trades accuracy vs. hop aggregation latency (C).
+  - algo choice         → trades accuracy vs. compute latency (G).
+
+--------------------------------------------------------------------------------
+3. TRANSPORT CONTRACT (WebSocket, formalised)
+--------------------------------------------------------------------------------
+URL:    wss://<host>/realtime/stream
+Frame:  WS binary message = int16 LE, mono, exactly hop_size samples.
+        WS text   message = UTF-8 JSON (config or reconfig).
+
+3.1  Client → Server  (first message, TEXT, mandatory)
+
+  {
+    "sr": 48000,              // int, must match AudioContext.sampleRate
+    "hop_size": 1024,         // int, 256..4096, multiple of 128 preferred
+    "algo": "auto",           // "yin"|"yinfft"|"aubio_yin"|"mpm"|"bacf"|
+                              // "obp"|"melodia"|"swipe"|"world"|
+                              // "parselmouth"|"auto"
+    "fmin": 65.0,             // voice: C2 ≈ 65 Hz
+    "fmax": 1000.0,           // voice: ~B5
+    "client_seq_start": 0     // NEW — see 3.4 (sequencing for alignment)
+  }
+
+  Server reply: {"ok": true, "type": "config_ack", ...existing payload...}
+
+3.2  Client → Server  (subsequent, BYTES)
+
+  ArrayBuffer, byteLength == hop_size * 2.
+  The client stamps a monotonic hop counter (seq) on the LAST binary frame
+  sent by piggy-backing it in a separate micro-JSON every N frames — NO, do
+  not mix. Instead: we trust ordering (WebSocket is TCP, in-order, reliable).
+  The server increments its own counter per BYTES message; the client does
+  the same on send. Because WS preserves order, seq_client == seq_server
+  at all times. No header bytes inside the PCM payload.
+
+3.3  Server → Client  (per-frame reply, TEXT)
+
+  {
+    "ok": true,
+    "type": "pitch",
+    "seq": 1234,               // NEW — echo the nth BYTES msg processed
+    "t_server": 12.384,        // existing "t" field renamed for clarity
+    "f0_hz": 220.12 | null,
+    "confidence": 0.87,
+    "note": "A3" | null,
+    "midi": 57.01 | null,      // NEW — convenient for the renderer
+    "voiced": true,            // NEW — voicing-gate result
+    "engine_rev": "...",
+    "proc_ms": 1.4             // NEW — server wall-time for this chunk
+  }
+
+  On unvoiced / no-pitch we still reply with ok:true, f0_hz:null, voiced:false.
+  The frontend needs every seq to keep the timeline continuous; never drop.
+
+3.4  Backpressure
+
+  The client maintains:  in_flight = seq_sent - seq_last_ack
+  If in_flight > MAX_INFLIGHT (default 4) the AudioWorklet SKIPS SEND for
+  this hop and logs a drop. Rationale: better a gap in the record than
+  queuing hundreds of ms of audio that will all arrive stale. This is the
+  single most important thing for "feels real-time" under jitter.
+
+--------------------------------------------------------------------------------
+4. SERVER THREADING MODEL
+--------------------------------------------------------------------------------
+Current code already does:  await run_in_threadpool(state.process_chunk, x)
+This is correct — numpy/aubio/pyworld release the GIL during heavy work, and
+it keeps the asyncio loop responsive. Keep it.
+
+Refinements:
+
+4.1  One RealtimePitchState per WebSocket connection. Already the case.
+     State contains: Preprocessor, chosen Pitcher instance(s), PostProcessor,
+     rolling buffers (for world/parselmouth), seq counter.
+
+4.2  Bounded per-connection work queue.
+     If the threadpool is saturated AND a new BYTES arrives AND the previous
+     process_chunk for THIS connection hasn't returned yet: drop the older
+     pending chunk, keep the newest. Implement with a length-1 asyncio.Queue
+     per connection + a consumer task. Prevents one slow estimator
+     (parselmouth cold start) from building 500 ms of backlog.
+
+4.3  Pin threadpool size: min(4, os.cpu_count()). One CPU-bound estimator per
+     connection; most users run 1 connection, so default is fine. For a
+     multi-user server, cap concurrent connections at threadpool_size * 2.
+
+4.4  Estimator selection strategy ("auto"):
+     Two-tier:
+       - "fast" tier (yin, mpm, bacf, obp)   — runs every hop.
+       - "slow" tier (world, parselmouth)    — runs every K hops (K=4),
+         used to correct octave errors in the fast tier.
+     The PostProcessor already has octave-lock; feed the slow-tier result
+     into it as a bias hint rather than a direct output.
+
+--------------------------------------------------------------------------------
+5. FRONTEND ARCHITECTURE (the missing piece)
+--------------------------------------------------------------------------------
+Tech: vanilla TypeScript + Vite (CORS origin already whitelisted), no React
+needed for this — a single page with a canvas and 3 controls.
+
+5.1  Module layout
+
+  src/
+  ├── audio/
+  │   ├── capture.ts           -- getUserMedia + AudioContext setup
+  │   ├── worklet-processor.js -- runs on audio thread, aggregates hops
+  │   └── transport.ts         -- WebSocket client, seq tracking, backpressure
+  ├── model/
+  │   └── note-feed.ts         -- ring buffer of {seq, t_client, midi, conf,
+  │                               voiced} for the renderer
+  ├── render/
+  │   ├── viewport.ts          -- Canvas 2D, scrolling piano-roll,
+  │                               cumulative-record style
+  │   └── hud.ts               -- current note + cents + confidence bar
+  └── main.ts                  -- wire everything, expose algo picker
+
+5.2  Audio capture (capture.ts)
+
+  const ctx = new AudioContext({
+    latencyHint: "interactive",
+    sampleRate: 48000          // force 48k everywhere; do NOT resample.
+  });
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      channelCount: 1,
+      echoCancellation:   false,  // CRITICAL — EC kills pitch info
+      noiseSuppression:   false,  // CRITICAL — NS kills harmonics
+      autoGainControl:    false,  // CRITICAL — AGC fights the voicing gate
+      sampleRate: 48000,
+      sampleSize: 16
+    }
+  });
+  const src = ctx.createMediaStreamSource(stream);
+  await ctx.audioWorklet.addModule("/worklet-processor.js");
+  const node = new AudioWorkletNode(ctx, "hop-aggregator", {
+    processorOptions: { hopSize: 1024 }
+  });
+  src.connect(node);
+  // Do NOT connect node -> ctx.destination (no feedback).
+  // IMPORTANT: some browsers garbage-collect disconnected graphs — connect
+  // node to a zero-gain GainNode -> destination to keep the graph alive.
+  node.port.onmessage = (e) => transport.sendHop(e.data as ArrayBuffer);
+
+5.3  AudioWorklet (worklet-processor.js)  — runs on audio render thread
+
+  class HopAggregator extends AudioWorkletProcessor {
+    // Preallocate hopSize Int16Array. Browser feeds 128-sample quanta.
+    // Accumulate float32 -> clamp -> int16 LE. When full, port.postMessage
+    // with transfer (zero-copy), swap to a second preallocated buffer.
+    // No allocation in the hot path.
+    process(inputs) {
+      const ch = inputs[0][0]; if (!ch) return true;
+      for (let i = 0; i < ch.length; i++) {
+        const s = Math.max(-1, Math.min(1, ch[i]));
+        this.buf[this.fill++] = (s * 32767) | 0;
+        if (this.fill === this.hop) {
+          this.port.postMessage(this.buf.buffer, [this.buf.buffer]);
+          this.buf = this.spare; this.spare = new Int16Array(this.hop);
+          this.fill = 0;
+        }
+      }
+      return true;
+    }
+  }
+
+  Why AudioWorklet and not ScriptProcessorNode or MediaRecorder:
+    - ScriptProcessorNode is deprecated and runs on main thread (jank).
+    - MediaRecorder gives compressed chunks with 100–250 ms granularity.
+    - AudioWorklet gives us 128-sample quanta (2.67 ms @48k) on a
+      dedicated, high-priority realtime thread.
+
+5.4  Transport (transport.ts)
+
+  - Wrap a WebSocket. ws.binaryType = "arraybuffer".
+  - sendHop(buf):
+        if (seqSent - seqAcked > MAX_INFLIGHT) { dropped++; return; }
+        ws.send(buf); seqSent++;
+        sentAt[seqSent % RING] = performance.now();  // for latency HUD
+  - onmessage(ev):
+        const m = JSON.parse(ev.data);
+        if (m.type === "pitch") {
+          seqAcked = m.seq;
+          const lat_ms = performance.now() - sentAt[m.seq % RING];
+          noteFeed.push({seq: m.seq, t_recv: performance.now(),
+                         midi: m.midi, conf: m.confidence, voiced: m.voiced,
+                         lat_ms});
+        }
+
+5.5  NoteFeed (note-feed.ts)
+
+  Ring buffer sized for ~60 s of history (≈ 2800 entries @ 21 ms hop).
+  Entry: { seq, t_recv (ms), midi (float|null), conf, voiced, lat_ms }.
+  Exposes:
+    push(e)
+    window(fromMs, toMs)   -- binary search on t_recv
+    latest()
+    lagMs()                -- EMA of lat_ms for HUD
+
+5.6  Renderer (viewport.ts) — the "cumulative record"
+
+  Cumulative-record style = scrolling strip, time on X, pitch on Y, the pen
+  never lifts (unvoiced segments draw a gap, not a reset). Think Skinner-box
+  chart but with MIDI on the Y axis.
+
+  Canvas 2D, not WebGL — we draw ~50 line segments per frame, Canvas is ample.
+
+  Layout:
+    Y axis: MIDI 36..84 (C2..C6), 12 px per semitone, horizontal grid lines
+            at every C, label every octave.
+    X axis: fixed pixels-per-second (default 80 px/s), content scrolls left,
+            "now" is a vertical line ~85% from the left edge (so the user
+            sees a little bit of "future" empty space — psychologically
+            helps with perceived latency).
+
+  Double-buffer trick for O(1) scrolling:
+    - Two canvases: offscreen "tape" (width = viewport + 1 hop worth of px)
+      and onscreen "view".
+    - Each rAF:
+        1. Compute dx = (now - lastFrameTime) * pxPerSec.
+        2. ctx.drawImage(tape, dx, 0, W, H, 0, 0, W, H)  // shift left
+        3. ctx.clearRect(W-dx, 0, dx, H)                 // clear new strip
+        4. Copy shifted tape back into tape (or use a rolling origin offset).
+        5. Draw new segments from noteFeed into the rightmost dx strip.
+    - This avoids redrawing 60 s of history every frame.
+
+  Segment drawing:
+    - Convert midi -> y:  y = H - (midi - 36) * 12
+    - Convert t_recv -> x relative to "now" line.
+    - Line width scaled by confidence (1–4 px).
+    - Colour: voiced = hsl(hue_by_note, 70%, 50%), unvoiced = transparent.
+    - If consecutive voiced frames differ by < 0.3 semitones, connect with a
+      line; else draw a dot (attack). This matches the PostProcessor's
+      jitter deadband of 0.18 st.
+
+  HUD overlay:
+    - Big text: current note name (from latest voiced frame).
+    - Cents meter: -50..+50 bar showing (midi - round(midi)) * 100.
+    - Small text: algo | hop | lag <ema>ms | dropped <n>.
+
+5.7  Controls (main.ts)
+
+  - <select> algo   -> send reconfig TEXT msg, server swaps estimator.
+  - <input>  hop    -> tear down worklet, rebuild with new hop, send reconfig.
+  - <button> clear  -> noteFeed.clear(), viewport.clear().
+
+--------------------------------------------------------------------------------
+6. CLOCK ALIGNMENT (so the X axis means something)
+--------------------------------------------------------------------------------
+Problem: the server tags each result with t_server (its own monotonic clock).
+The client has t_recv (performance.now()). Neither is the *capture* time.
+
+Correct capture time for hop seq N:
+    t_capture = t_first_send + N * (hop_size / sr) - (hop_size / sr) / 2
+                (the "/2" centres the timestamp on the middle of the window)
+
+The client knows t_first_send and seq, so it can compute t_capture exactly,
+independent of network jitter. Use t_capture for the X axis. Use t_recv only
+for the latency HUD. Ignore t_server entirely on the client — it's for
+server-side logging.
+
+This means: a pitch result that arrives 30 ms late still draws at the CORRECT
+x position. The viewport appears to "catch up" in one rAF frame instead of
+smearing — visually cleaner.
+
+--------------------------------------------------------------------------------
+7. ESTIMATOR-SPECIFIC LATENCY NOTES
+--------------------------------------------------------------------------------
+  yin / mpm / bacf / obp / swipe / melodia:
+    Stateless on the server (pure functions on the current hop buffer).
+    Latency = hop aggregation + compute. Best for real-time.
+    Compute on a 1024-sample frame: 0.5–3 ms (numpy on modern CPU).
+    → default these for the web UI.
+
+  yinfft / aubio_yin:
+    Stateful (aubio maintains an internal buffer). Compute ≈ 0.3–1 ms
+    (C implementation). Very good choice if aubio is installed.
+    → recommended default = "aubio_yin" if available, else "mpm".
+
+  pyworld (DIO+StoneMask):
+    Needs a 450 ms rolling buffer before first output. Excellent accuracy,
+    but latency floor is ~100 ms even after warm-up.
+    → NOT suitable for the primary per-hop path. Use as the "slow oracle"
+      in auto mode (every 4th hop) to feed octave hints to the PostProcessor.
+
+  parselmouth (Praat AC):
+    Similar story: 400 ms buffer, 80–300 ms warm-up. Same treatment as world.
+
+--------------------------------------------------------------------------------
+8. DEPLOYMENT TOPOLOGIES / FALLBACKS
+--------------------------------------------------------------------------------
+8.1  Local-first (recommended)
+     uvicorn on localhost:8000, Vite dev on localhost:5173.
+     Network stage collapses to ~0.5 ms RTT. Total latency 25–40 ms.
+     This is the sweet spot. Ship this.
+
+8.2  LAN (classroom / studio)
+     Same but over a switch. 2–5 ms RTT. Still fine.
+
+8.3  WAN (hosted)
+     RTT 30–80 ms starts to hurt. Two mitigations:
+       a) Reduce hop_size to 512 (halves aggregation latency, loses some
+          low-freq accuracy — fmin moves up to ~100 Hz comfortably).
+       b) Client-side WASM estimator fallback: compile the pure-python
+          yin/mpm to WASM via Pyodide, or port mpm.py to JS (it's ~120 LOC).
+          Then the server is only used for algo-switching and the slow
+          oracle. The WS reply becomes advisory, not authoritative.
+     Only do (b) if WAN is a real requirement; it duplicates logic.
+
+--------------------------------------------------------------------------------
+9. MINIMAL SERVER CHANGES REQUIRED
+--------------------------------------------------------------------------------
+The backend is 90% there. Additions to routers/stream.py and
+operations/models.py:
+
+  - Add seq counter to stream() loop; echo it in the reply.
+  - Add "midi" and "voiced" to the reply payload.
+  - Add "proc_ms" (wrap process_chunk in time.perf_counter()).
+  - Optional: implement the length-1 pending-chunk queue (§4.2).
+  - Optional: "auto" mode's slow-oracle cadence knob in EngineConfig.
+
+Everything else — Preprocessor, PostProcessor, estimator dispatch, note name
+conversion — already exists and is correctly shaped for this architecture.
+
+--------------------------------------------------------------------------------
+10. SUMMARY
+--------------------------------------------------------------------------------
+  Mic → AudioWorklet(hop) → WS binary int16le → threadpool(Pre→Est→Post)
+     → WS text JSON{seq,midi,conf,voiced} → NoteFeed ring → rAF canvas
+     scrolling piano-roll with t_capture-aligned X axis.
+
+  The single biggest latency win is: AudioWorklet + small hop + disable
+  browser AEC/NS/AGC + backpressure drop-not-queue. The single biggest
+  correctness win is: plot against computed t_capture, not t_recv.
+
+  Keep the existing WebSocket protocol. Don't reach for WebRTC.
+================================================================================
