@@ -1,0 +1,475 @@
+================================================================================
+REALTIME PITCH — ARCHITECTURE v6
+Student identity model clarification + WebRTC feasibility for full
+audio/video communication alongside f0 estimation.
+================================================================================
+
+================================================================================
+QUESTION 1 — STUDENT IDENTITY: room-link vs. own-practice-room
+================================================================================
+
+--------------------------------------------------------------------------------
+1.1  CLARIFYING THE OPTIONS
+--------------------------------------------------------------------------------
+You described:
+  (1) Student enters via the TEACHER'S room link/QR.  If teacher isn't there,
+      student can practice exercises alone.
+  (2) Student gets their OWN practice room (still no account, just a key).
+      Can practice anytime; teacher joins the student's room when lesson starts.
+
+At first glance these look similar.  The real question is:
+      WHOSE room is it — the teacher's or the student's?
+
+--------------------------------------------------------------------------------
+1.2  WHY (2) IS STRICTLY BETTER
+--------------------------------------------------------------------------------
+The v5 design already answers this: the student_key IS option (2).
+Here's why option (1) falls apart:
+
+  PROBLEM WITH (1)                    CONSEQUENCE
+  ──────────────────────────────────  ──────────────────────────────────────
+  All of a teacher's students enter   Maria enters the room.  She sees Juan's
+  the SAME link.                      exercises, Juan's session history.
+                                      You'd need a second auth step to tell
+                                      them apart.  That second step IS the
+                                      student_key.  So you're doing (2) anyway.
+
+  Teacher's room link identifies the  Two students can't practice at the same
+  TEACHER, not the STUDENT.           time (same room).  Or the room becomes
+                                      multi-tenant and you need per-student
+                                      state inside it → effectively (2).
+
+  If the QR leaks (student screenshots Access to the teacher's entire roster,
+  it, forwards it), anyone with it    not just one student's practice space.
+  lands in the teacher's room.
+
+  Session persistence requires        "Which student was this session?"  The
+  knowing WHICH student was singing.  teacher's link doesn't answer that.
+                                      You'd need them to self-identify.
+                                      That's a key.  Back to (2).
+
+Option (1) works for a pure-anonymous demo (no persistence, no assignments).
+The moment you want assignments tied to a person, you need the person
+identified.  The key does that.
+
+--------------------------------------------------------------------------------
+1.3  WHAT (2) LOOKS LIKE (concretely, simplified from v5)
+--------------------------------------------------------------------------------
+
+  Teacher creates a student → server generates student_key → teacher gets
+  a permanent link / QR:  https://domain.com/?k=KBXW43TN
+
+  Student bookmarks that link once.  Every visit:
+
+    ┌─ Student opens /?k=KBXW43TN ────────────────────────────────────┐
+    │                                                                  │
+    │   Server: key → student_id → sets cookie → loads student's       │
+    │           practice room.                                         │
+    │                                                                  │
+    │   If teacher is ONLINE and has opened the dashboard:             │
+    │     → Teacher sees "Juan is here" notification.                  │
+    │     → Teacher clicks "Join" → joins as observer (v4 flow).       │
+    │     → Full lesson mode: pitch viewport + voice + video (see Q2). │
+    │                                                                  │
+    │   If teacher is OFFLINE:                                         │
+    │     → Student sees "Practice Mode — teacher not here".           │
+    │     → Assignment list visible ("you have 3 exercises pending").  │
+    │     → Student picks an exercise, target contour loads, starts    │
+    │       singing.  WASM MPM runs locally.  Advisory Melodia runs.   │
+    │     → Session is LOGGED to session_log (teacher_id = null).      │
+    │     → Teacher reviews later in their dashboard.                  │
+    │                                                                  │
+    └──────────────────────────────────────────────────────────────────┘
+
+  The room belongs to the STUDENT.  The teacher VISITS it.
+  This is the natural model:
+    - A student has one practice room (their key).
+    - A teacher visits many practice rooms (one per student).
+    - The server routes teacher → student via the teacher's dashboard,
+      not via a shared link.
+
+  Only change to v5's WebSocket handshake:
+
+    Student WS first-msg:  {"role": "student"}   (key already in cookie)
+    Teacher WS first-msg:  {"role": "teacher", "student_id": "<uuid>"}
+
+  The server checks teacher.id owns student_id → admits teacher to the
+  student's SessionRoom.
+
+--------------------------------------------------------------------------------
+1.4  EDGE CASE — STUDENT HAS MULTIPLE TEACHERS
+--------------------------------------------------------------------------------
+In v5, student_key is owned by exactly one teacher (student.teacher_id FK).
+If a student has two teachers (voice + piano, say), they get two keys — one
+per teacher.  Different assignments, different practice rooms, different
+session history per teacher.  This is usually what you want.
+
+If you need a student shared across teachers (same key, multi-teacher
+visibility), that's a schema change (student_teacher join table) — but it
+complicates "whose exercises does the student see?"  Don't build it until
+a teacher actually asks for it.
+
+--------------------------------------------------------------------------------
+1.5  VERDICT
+--------------------------------------------------------------------------------
+Go with (2).  It's what v5 already designed — the student_key IS the
+student's practice room identifier.  Option (1) collapses back to (2) the
+moment you need to distinguish students.
+
+The QR code is just a convenience wrapper around the key:
+      QR encodes → https://domain.com/?k=KBXW43TN
+Teacher generates it once per student from the dashboard.  Student scans it
+once, browser remembers the cookie.
+
+
+================================================================================
+QUESTION 2 — WebRTC FEASIBILITY: audio + video alongside f0 estimation
+================================================================================
+
+--------------------------------------------------------------------------------
+2(a)  THE MICROPHONE-CONTENTION PROBLEM IS REAL AND YOU'RE RIGHT TO WORRY
+--------------------------------------------------------------------------------
+Your instinct is correct.  If the teacher and student are on a separate
+Zoom/Meet call while using your app:
+
+  - Zoom claims the mic via its own getUserMedia (or native API).
+  - Your app's getUserMedia may still succeed (browsers generally allow
+    multiple tabs to share the mic), BUT:
+    - Zoom applies AEC/NS/AGC at the OS or browser level.  Your tab may
+      receive the PROCESSED signal, not the raw one.  AEC kills
+      fundamental-harmonic structure.  Your f0 estimation degrades.
+    - Some platforms (older macOS CoreAudio, some Windows drivers) give
+      exclusive mic access to the first claimant.  Your app gets silence.
+    - The user now has TWO pieces of software fighting over input gain.
+
+  The clean solution is exactly what you said: put the communication
+  channel INSIDE your app so you own the mic pipeline end to end.
+
+--------------------------------------------------------------------------------
+2(b)  REAL-TIME AUDIO BOTH WAYS — FEASIBLE?  YES.
+--------------------------------------------------------------------------------
+Short answer: yes, with zero impact on f0 latency.
+
+The key insight: YOU ALREADY HAVE THE RAW MIC STREAM.  WebRTC doesn't need
+its own microphone — you hand it the SAME MediaStreamTrack you're already
+feeding to your AudioWorklet.  One capture, two consumers.
+
+  ┌─ Student's browser ────────────────────────────────────────────────────┐
+  │                                                                         │
+  │  getUserMedia({audio: {echoCancellation:false,                          │
+  │                        noiseSuppression:false,                          │
+  │                        autoGainControl:false}})                         │
+  │       │                                                                 │
+  │       │ (same MediaStreamTrack — zero-copy fan-out)                     │
+  │       │                                                                 │
+  │       ├──────────────────────────────────┬──────────────────────────────│
+  │       │                                  │                              │
+  │       ▼                                  ▼                              │
+  │  AudioContext                      RTCPeerConnection                    │
+  │   createMediaStreamSource()         addTrack(audioTrack)                │
+  │   → AudioWorklet                    → Opus encode (browser does this)   │
+  │   → WASM MPM  ────────┐             → DTLS/SRTP → teacher's browser     │
+  │                        │                                                 │
+  │                        ▼                                                 │
+  │   NoteFeed → Canvas (piano-roll)                                         │
+  │                                                                         │
+  │   ▲                                                                     │
+  │   │  (teacher's audio arrives via the PeerConnection's remote track)    │
+  │   │                                                                     │
+  │   └── <audio> element (plays teacher's voice)                           │
+  │                                                                         │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  Adding a MediaStreamTrack to an RTCPeerConnection does NOT consume,
+  block, or modify the track.  It's a passive tap.  The AudioWorklet on
+  the other branch sees IDENTICAL samples, at IDENTICAL timing.
+
+  f0 latency impact:          0 ms.  Nothing in the f0 path changes.
+  WebRTC audio latency:       50–200 ms (Opus frame + jitter buffer + RTT).
+                              This is for the HUMAN CONVERSATION path, not
+                              the pitch path.  Teachers are used to 150 ms
+                              from Zoom; this is the same.
+
+--------------------------------------------------------------------------------
+2(b) continued — THE ECHO CANCELLATION CONFLICT (the real problem)
+--------------------------------------------------------------------------------
+There IS one non-trivial interaction: echo cancellation.
+
+  We deliberately DISABLE echoCancellation (v1 §5.2) because it destroys
+  harmonics.  But in a two-way audio call with speakers, the teacher's
+  voice plays out the student's speakers → bleeds into the student's
+  mic → the teacher hears themselves echo.
+
+  Without AEC, open-speaker two-way audio is unusable.
+
+  SOLUTION SPACE:
+
+  ┌─ Option A — Headphones required ─────────────────────────────────────┐
+  │ If the student wears headphones, there is NO acoustic feedback path. │
+  │ No echo.  No AEC needed.  Mic constraints stay as-is.                │
+  │                                                                       │
+  │ This is the CORRECT answer for a singing-lesson product:             │
+  │   - Singers already wear in-ears or cans for monitoring.             │
+  │   - Headphones let the student hear themselves + a backing track     │
+  │     + the teacher, all mixed locally, without feedback.              │
+  │   - Zero engineering cost.                                           │
+  │                                                                       │
+  │ Implement it as:                                                      │
+  │   - A one-time onboarding card: "Please use headphones for best       │
+  │     results.  Speaker feedback will echo to your teacher."           │
+  │   - Detect potential feedback: if the incoming teacher-audio         │
+  │     correlates with the student's mic signal (cross-correlation,      │
+  │     cheap in the AudioWorklet), show a "we detect echo — headphones?"│
+  │     warning.                                                          │
+  └───────────────────────────────────────────────────────────────────────┘
+
+  ┌─ Option B — Dual-constraint tracks (works, adds complexity) ─────────┐
+  │ Acquire TWO audio tracks with different constraints:                  │
+  │                                                                       │
+  │   trackRaw  = getUserMedia({audio: {echoCancellation:false, ...}})    │
+  │               → feeds AudioWorklet → WASM MPM (pitch path)            │
+  │                                                                       │
+  │   trackComm = getUserMedia({audio: {echoCancellation:true,            │
+  │                                     noiseSuppression:true}})          │
+  │               → feeds RTCPeerConnection (voice path to teacher)       │
+  │                                                                       │
+  │ CAVEATS:                                                              │
+  │   - Browser behavior varies.  Chrome/Edge reliably open two tracks    │
+  │     with different processing.  Firefox sometimes gives you the same  │
+  │     processed track twice.  Safari is unpredictable.                  │
+  │   - On some OSes, the second getUserMedia prompts again for mic       │
+  │     permission.  Annoying UX.                                         │
+  │   - The teacher hears AEC-processed audio (slightly robotic on vocal  │
+  │     onset/offset).  Fine for conversation, but if the teacher wants   │
+  │     to EVALUATE TONE QUALITY by ear, AEC processing is a nuisance.    │
+  └───────────────────────────────────────────────────────────────────────┘
+
+  ┌─ Option C — Software AEC applied only to the comm path ──────────────┐
+  │ Keep one raw track.  Route it to BOTH the AudioWorklet (pitch) and   │
+  │ a second AudioWorklet that runs a WASM AEC (e.g., the WebRTC AEC3     │
+  │ module compiled to WASM, or SpeexDSP).  AEC'd output feeds the        │
+  │ RTCPeerConnection.                                                    │
+  │                                                                       │
+  │ This is the "best of both worlds" but it's genuinely complex:        │
+  │   - AEC needs the far-end signal (teacher's voice) as reference.      │
+  │   - You'd wire teacher's incoming audio into the AEC worklet too.     │
+  │   - AEC libs in WASM exist but are fiddly to integrate.               │
+  │   - ~1 week of work if you've done audio DSP before, more if not.     │
+  │                                                                       │
+  │ Do this LATER if Option A (headphones) proves insufficient.           │
+  └───────────────────────────────────────────────────────────────────────┘
+
+  RECOMMENDATION:  A first.  B as a fallback flag.  Skip C.
+  Enforce/strongly-suggest headphones.  It's the norm in music teaching
+  anyway, and it makes your life 10× simpler.
+
+--------------------------------------------------------------------------------
+2(c)  REAL-TIME VIDEO + AUDIO — FEASIBLE?  YES.
+--------------------------------------------------------------------------------
+Adding video is ALMOST FREE once you have the WebRTC audio path, because:
+
+  - Video uses a DIFFERENT capture device (camera, not mic).  Zero
+    interaction with the mic pipeline.  Zero impact on f0.
+
+  - Video encoding (VP8/VP9/H.264/AV1) runs on the GPU or a dedicated
+    hardware encoder on every laptop/phone made in the last decade.  It
+    does not compete with WASM MPM for CPU.
+
+  - Bandwidth: 720p video at ~1.5 Mbps is well within residential
+    upstream.  If bandwidth is tight, the browser's congestion control
+    will drop the VIDEO bitrate first and keep the audio — exactly the
+    priority you want for a voice lesson.
+
+  Student side:
+    camStream = await navigator.mediaDevices.getUserMedia({video: true});
+    pc.addTrack(camStream.getVideoTracks()[0], camStream);
+
+  Teacher side (symmetric).
+
+  Render: teacher's incoming video in a small <video> element in a corner
+  of the piano-roll page.  Student sees teacher's face; teacher sees
+  student's posture/mouth (VERY useful for voice teaching — breath
+  support and jaw tension are visual diagnostics).
+
+  f0 latency impact:  0 ms.  Completely orthogonal.
+
+--------------------------------------------------------------------------------
+2.X  WebRTC TOPOLOGY — P2P IS FINE HERE
+--------------------------------------------------------------------------------
+You have exactly 2 participants per session (teacher + student).  This is
+the one case where WebRTC P2P shines:
+
+  - No SFU/MCU server needed.  Media goes directly browser-to-browser.
+  - Your server's ONLY new job: WebRTC signaling (SDP offer/answer
+    exchange + ICE candidates).  This is ~10 messages at session start,
+    all small JSON, all over the existing WebSocket.  It adds 2 message
+    types to your WS protocol.  That's it.
+
+  STUN server:  use a public one (stun:stun.l.google.com:19302) or
+                self-host coturn (5-line config).
+
+  TURN server:  needed for ~5–15% of users behind symmetric NAT
+                (corporate networks, some mobile carriers).  Self-host
+                coturn on the same VPS, or use a free tier from a WebRTC
+                PaaS.  TURN relay bandwidth at 2 Mbps/user × 100 users =
+                200 Mbps worst case — but in practice most pairs connect
+                P2P and TURN handles only the stubborn 10%.
+
+  Signaling messages added to /realtime/stream WS:
+
+    {"type": "rtc_offer",     "sdp": "..."}           student → server → teacher
+    {"type": "rtc_answer",    "sdp": "..."}           teacher → server → student
+    {"type": "rtc_ice",       "candidate": {...}}     either direction
+
+    Server is a dumb relay for these.  SessionRoom already knows both
+    WebSockets.  ~30 lines of code in stream.py.
+
+--------------------------------------------------------------------------------
+2.Y  LATENCY BUDGET WITH WebRTC ADDED
+--------------------------------------------------------------------------------
+
+  Path                                 Latency       Notes
+  ───────────────────────────────────  ────────────  ─────────────────────────
+  STUDENT PITCH (unchanged)
+    Mic → Worklet → WASM MPM → Canvas  25–40 ms      Local loop.  WebRTC is
+                                                      not in this path.
+  MELODIA ADVISORY (unchanged)
+    Student → WS → server → Melodia    40–120 ms     Advisory only; does not
+    → WS → student                                    block drawing.
+
+  TEACHER PITCH OBSERVATION (unchanged from v4)
+    Student pitch → WS → server        40–80 ms      Teacher's piano-roll is
+    → WS → teacher canvas                             ~1 RTT behind.  Fine.
+
+  TEACHER HEARS STUDENT (new, WebRTC)
+    Student mic → Opus → P2P →         50–200 ms     Standard VoIP latency.
+    teacher Opus decode → speaker                     Teachers expect this
+                                                      from Zoom.
+
+  STUDENT HEARS TEACHER (new, WebRTC)
+    Teacher mic → Opus → P2P →         50–200 ms     Same.  Student hears
+    student speaker                                   teacher's instructions.
+
+  VIDEO BOTH WAYS (new, WebRTC)
+    Camera → VP8/9 → P2P → decode      80–250 ms     Slightly higher than
+    → <video>                                         audio (larger frames).
+                                                      Lip sync handled by
+                                                      browser automatically.
+
+  INTERACTIONS BETWEEN PATHS:         none.          All paths are parallel.
+                                                      The slowest path (video)
+                                                      does not gate the
+                                                      fastest (local pitch).
+
+--------------------------------------------------------------------------------
+2.Z  FEASIBILITY SUMMARY
+--------------------------------------------------------------------------------
+
+  2(a) Mic contention with Zoom:   Real problem.  Solved by putting
+                                   communication IN your app.
+  2(b) Two-way audio feasible:     Yes.  Zero f0 impact.  One getUserMedia
+                                   feeds both WASM MPM and WebRTC.
+                                   Require headphones to avoid the AEC
+                                   conflict.
+  2(c) Video + audio feasible:     Yes.  Video is orthogonal to audio
+                                   capture.  GPU-encoded, doesn't touch
+                                   the mic.  Zero f0 impact.
+
+  The ONE real constraint:         HEADPHONES.  Without them, two-way
+                                   audio needs AEC, and AEC fights your
+                                   pitch detector.  Make headphones a
+                                   product requirement.  Every voice
+                                   student already owns a pair.
+
+
+================================================================================
+PART 3 — UPDATED DATA FLOW DIAGRAM (all channels)
+================================================================================
+
+  Student Browser                     Server              Teacher Browser
+  ┌─────────────────┐                ┌─────────┐         ┌─────────────────┐
+  │ Mic (raw, no    │                │         │         │                 │
+  │ AEC/NS/AGC)     │                │         │         │                 │
+  │  │              │                │         │         │                 │
+  │  ├──→ Worklet   │                │         │         │                 │
+  │  │   → MPM.wasm │─ PCM(Kth) ───→ │ Melodia │         │                 │
+  │  │   → NoteFeed │← advisory ──── │         │         │                 │
+  │  │   → Canvas   │                │         │         │                 │
+  │  │              │─ {midi,conf} → │ Session │─ pitch → │ Canvas (piano-  │
+  │  │              │  (every hop)   │  Room   │  events  │  roll, observer)│
+  │  │              │                │         │         │                 │
+  │  │              │← teacher_cmd ─ │         │←────────│ (overlay,       │
+  │  │              │  (overlay,     │         │          │  markers,       │
+  │  │              │   markers)     │         │          │  controls)      │
+  │  │              │                │         │         │                 │
+  │  │              │── rtc_offer ──→│ (signal │── offer→│                 │
+  │  │              │← rtc_answer ───│  relay) │←answer──│                 │
+  │  │              │←─ rtc_ice ────→│         │←─ ice ─→│                 │
+  │  │              │                │         │         │                 │
+  │  └──→ RTCPeer   │══════════ P2P Opus audio ═══════════│ <audio> ◀──┐   │
+  │       Connection│══════════ P2P VP8/9 video ══════════│ <video> ◀─ │   │
+  │                 │                │         │         │  Mic ──────┤   │
+  │ <audio> ◀───────│════ (symmetric P2P from teacher) ═══│  (AEC off  │   │
+  │ <video> ◀───────│══════════════════════════════════════│  if head-  │   │
+  │                 │                │         │         │  phones)   │   │
+  │ Camera ─────────│═══════════════ P2P video ═══════════│ <video>   │   │
+  └─────────────────┘                └─────────┘         └─────────────────┘
+
+  ──── WebSocket (JSON + binary)       ════ WebRTC (SRTP, P2P)
+
+  All channels parallel.  Pitch-critical path (top-left block) is
+  unchanged from v1.
+
+
+================================================================================
+PART 4 — WHAT TO ADD TO THE BUILD ORDER (extends v5 §Part 8)
+================================================================================
+
+  PHASE 5 — Two-way communication (after v5's Phase 1–4)
+
+  17. Add WebRTC signaling message types to /realtime/stream WS handler.
+      3 types: rtc_offer, rtc_answer, rtc_ice.  Server is a dumb relay
+      via SessionRoom.  ~30 LOC in stream.py.
+
+  18. Student frontend: on session start + teacher join, create
+      RTCPeerConnection, add the EXISTING mic track (same getUserMedia
+      stream the AudioWorklet uses), send offer.
+
+  19. Teacher frontend: on offer receipt, create RTCPeerConnection,
+      add their own mic track, send answer.  Both sides trickle ICE.
+
+  20. Both sides: on remote track, attach to <audio srcObject>.  Done.
+      Audio-only first.  Test with headphones.
+
+  21. Add camera: both sides getUserMedia({video:true}), addTrack,
+      attach remote video track to a small <video> element in the
+      corner of the piano-roll.
+
+  22. Set up coturn (STUN + TURN) on the VPS.  Or use a managed STUN
+      for MVP and add TURN when the first user hits NAT problems.
+
+  23. "Headphones please" onboarding card + echo-detection warning
+      (cross-correlation of incoming teacher audio vs. mic signal,
+      threshold → banner).
+
+  24. (Optional, later) Dual-constraint tracks (Option B) as a fallback
+      for users who refuse headphones.  Feature-flag it.
+
+
+================================================================================
+SUMMARY
+================================================================================
+
+  Q1:  Go with option (2) — student owns their own practice room via the
+       student_key.  v5 already designed this correctly.  The link/QR is
+       just a convenient wrapper around the key.  Option (1) collapses
+       back to (2) the moment you need to distinguish students.
+
+  Q2:  WebRTC audio + video is fully feasible with ZERO impact on f0
+       latency.  The mic stream fans out (same MediaStreamTrack → both
+       AudioWorklet and RTCPeerConnection).  Video is orthogonal.
+       Server only relays signaling (3 new WS message types).
+       The ONE real constraint: require headphones to avoid the
+       echo-cancellation conflict.  This is a product requirement,
+       not an engineering obstacle.
+================================================================================
