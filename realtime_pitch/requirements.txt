@@ -1,9 +1,0 @@
-# realtime_pitch/requirements.txt
-fastapi
-uvicorn[standard]
-setuptools==69.5.1
-
-numpy==1.26.4
-aubio==0.4.9
-pyworld==0.3.4
-praat-parselmouth==0.4.5
